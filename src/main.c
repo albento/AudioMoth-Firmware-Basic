@@ -17,6 +17,14 @@
 #include "audioconfig.h"
 #include "digitalfilter.h"
 
+/* STFT feasibility debug mode - set to 0 to restore normal recording firmware */
+
+#define STFT_DEBUG_MODE                          1
+
+#if STFT_DEBUG_MODE
+#include "arm_math.h"
+#endif
+
 /* Useful time constants */
 
 #define MICROSECONDS_IN_SECOND                  1000000
@@ -1485,6 +1493,10 @@ static uint8_t firmwareDescription[AM_FIRMWARE_DESCRIPTION_LENGTH] = "AudioMoth-
 
 static AM_recordingState_t makeRecording(uint32_t timeOfNextRecording, uint32_t recordDuration, uint32_t timeAtWhichToSwitchOffLED, AM_extendedBatteryState_t extendedBatteryState, int32_t temperature, uint32_t *fileOpenTime, uint32_t *fileOpenMilliseconds);
 
+#if STFT_DEBUG_MODE
+static void runSTFTFeasibilityTest(void);
+#endif
+
 static void scheduleRecording(uint32_t currentTime, uint32_t *timeOfNextRecording, uint32_t *indexOfNextRecording, uint32_t *durationOfNextRecording, uint32_t *startOfRecordingPeriod, uint32_t *endOfRecordingPeriod);
 
 static void determineTimeOfNextSunriseSunsetCalculation(uint32_t currentTime, uint32_t *timeOfNextSunriseSunsetCalculation);
@@ -1684,6 +1696,18 @@ int main(void) {
     /* Initialise device */
 
     AudioMoth_initialise();
+
+#if STFT_DEBUG_MODE
+
+    /* Bypass the normal recording schedule for the STFT timing test, but only when the switch is not in the USB position. If it is, fall through to the normal firmware flow below so AudioMoth_handleUSB() still runs and the device can always be reflashed via the switch, without needing the hardware bootloader trick. */
+
+    if (AudioMoth_getSwitchPosition() != AM_SWITCH_USB) {
+
+        runSTFTFeasibilityTest();
+
+    }
+
+#endif
 
     AM_switchPosition_t switchPosition = AudioMoth_getSwitchPosition();
 
@@ -2753,6 +2777,285 @@ inline void AudioMoth_handleSwitchInterrupt() {
 
 }
 
+#if STFT_DEBUG_MODE
+
+/* STFT feasibility test parameters - buffer is 1024 samples at 16kHz (64ms) */
+
+#define STFT_SAMPLE_RATE                         16000
+
+#define STFT_FFT_LENGTH                          256
+
+#define STFT_HOP_LENGTH                          128
+
+#define STFT_NUMBER_OF_FRAMES                    ((MAXIMUM_SAMPLES_IN_DMA_TRANSFER - STFT_FFT_LENGTH) / STFT_HOP_LENGTH + 1)
+
+#define STFT_NUMBER_OF_BINS                       (STFT_FFT_LENGTH / 2 + 1)
+
+#define STFT_LOG_EPSILON                          1.0e-6f
+
+#define STFT_TWO_PI                               6.28318530717958647692f
+
+#define STFT_TIMING_QUEUE_LENGTH                  8
+
+/* Selects how the spectrogram magnitude is scaled, to compare their STFT timing cost against each other */
+
+#define STFT_LOG_MODE_LINEAR                      0
+#define STFT_LOG_MODE_LOG10F                      1
+#define STFT_LOG_MODE_VLOG                        2
+
+#define STFT_LOG_MODE                             STFT_LOG_MODE_VLOG
+
+/* 20/ln(10): converts arm_vlog_f32's natural log output to 20*log10(x) with a single multiply */
+
+#define STFT_20_OVER_LN10                         8.68588963806f
+
+#if STFT_LOG_MODE == STFT_LOG_MODE_LOG10F
+#define STFT_LOG_FILENAME                         "STFT_TIMING.CSV"
+#elif STFT_LOG_MODE == STFT_LOG_MODE_VLOG
+#define STFT_LOG_FILENAME                         "STFT_TIMING_VLOG.CSV"
+#else
+#define STFT_LOG_FILENAME                         "STFT_TIMING_NOLOG.CSV"
+#endif
+
+typedef struct {
+    uint32_t bufferIndex;
+    uint32_t elapsedMicroseconds;
+} stftTimingEntry_t;
+
+static arm_rfft_fast_instance_f32 stftFFTInstance;
+
+static float32_t stftWindow[STFT_FFT_LENGTH];
+
+static float32_t stftFrame[STFT_FFT_LENGTH];
+
+static float32_t stftFFTOutput[STFT_FFT_LENGTH];
+
+static float32_t stftMagnitude[STFT_NUMBER_OF_BINS];
+
+/* Log-magnitude spectrogram of the buffer currently being processed. Declared volatile so the compiler cannot optimise away the STFT computation that fills it. */
+
+static volatile float32_t stftSpectrogramDb[STFT_NUMBER_OF_FRAMES][STFT_NUMBER_OF_BINS];
+
+static volatile stftTimingEntry_t stftTimingQueue[STFT_TIMING_QUEUE_LENGTH];
+
+static volatile uint32_t stftTimingQueueWriteIndex;
+
+static volatile uint32_t stftTimingQueueReadIndex;
+
+static volatile uint32_t stftBufferCounter;
+
+/* Replaces the normal recording ISR: instead of filtering the buffer into the SD card recording pipeline, compute its STFT and time how long that takes */
+
+inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, int16_t **nextBuffer) {
+
+    int16_t *source = isPrimaryBuffer ? primaryBuffer : secondaryBuffer;
+
+    uint32_t startTime, startMicroseconds;
+
+    AudioMoth_getTimeMicroseconds(&startTime, &startMicroseconds);
+
+    for (uint32_t frame = 0; frame < STFT_NUMBER_OF_FRAMES; frame += 1) {
+
+        uint32_t offset = frame * STFT_HOP_LENGTH;
+
+        for (uint32_t i = 0; i < STFT_FFT_LENGTH; i += 1) {
+
+            stftFrame[i] = (float32_t)source[offset + i] * stftWindow[i];
+
+        }
+
+        arm_rfft_fast_f32(&stftFFTInstance, stftFrame, stftFFTOutput, 0);
+
+        /* CMSIS-DSP packs the real DC and Nyquist bins into the first complex slot of the output */
+
+#if STFT_LOG_MODE == STFT_LOG_MODE_LOG10F
+
+        stftSpectrogramDb[frame][0] = 20.0f * log10f(fabsf(stftFFTOutput[0]) + STFT_LOG_EPSILON);
+
+        stftSpectrogramDb[frame][STFT_FFT_LENGTH / 2] = 20.0f * log10f(fabsf(stftFFTOutput[1]) + STFT_LOG_EPSILON);
+
+        for (uint32_t bin = 1; bin < STFT_FFT_LENGTH / 2; bin += 1) {
+
+            float32_t re = stftFFTOutput[2 * bin];
+
+            float32_t im = stftFFTOutput[2 * bin + 1];
+
+            stftSpectrogramDb[frame][bin] = 20.0f * log10f(sqrtf(re * re + im * im) + STFT_LOG_EPSILON);
+
+        }
+
+#elif STFT_LOG_MODE == STFT_LOG_MODE_VLOG
+
+        stftMagnitude[0] = fabsf(stftFFTOutput[0]) + STFT_LOG_EPSILON;
+
+        stftMagnitude[STFT_FFT_LENGTH / 2] = fabsf(stftFFTOutput[1]) + STFT_LOG_EPSILON;
+
+        for (uint32_t bin = 1; bin < STFT_FFT_LENGTH / 2; bin += 1) {
+
+            float32_t re = stftFFTOutput[2 * bin];
+
+            float32_t im = stftFFTOutput[2 * bin + 1];
+
+            stftMagnitude[bin] = sqrtf(re * re + im * im) + STFT_LOG_EPSILON;
+
+        }
+
+        /* arm_vlog_f32 computes the natural log of the whole vector in one call; converted to 20*log10(x) with a single multiply afterwards */
+
+        arm_vlog_f32(stftMagnitude, stftMagnitude, STFT_NUMBER_OF_BINS);
+
+        for (uint32_t bin = 0; bin < STFT_NUMBER_OF_BINS; bin += 1) {
+
+            stftSpectrogramDb[frame][bin] = STFT_20_OVER_LN10 * stftMagnitude[bin];
+
+        }
+
+#else
+
+        stftSpectrogramDb[frame][0] = fabsf(stftFFTOutput[0]);
+
+        stftSpectrogramDb[frame][STFT_FFT_LENGTH / 2] = fabsf(stftFFTOutput[1]);
+
+        for (uint32_t bin = 1; bin < STFT_FFT_LENGTH / 2; bin += 1) {
+
+            float32_t re = stftFFTOutput[2 * bin];
+
+            float32_t im = stftFFTOutput[2 * bin + 1];
+
+            stftSpectrogramDb[frame][bin] = sqrtf(re * re + im * im);
+
+        }
+
+#endif
+
+    }
+
+    uint32_t endTime, endMicroseconds;
+
+    AudioMoth_getTimeMicroseconds(&endTime, &endMicroseconds);
+
+    uint32_t elapsedMicroseconds = (endTime - startTime) * MICROSECONDS_IN_SECOND + endMicroseconds - startMicroseconds;
+
+    uint32_t nextWriteIndex = (stftTimingQueueWriteIndex + 1) & (STFT_TIMING_QUEUE_LENGTH - 1);
+
+    if (nextWriteIndex != stftTimingQueueReadIndex) {
+
+        stftTimingQueue[stftTimingQueueWriteIndex].bufferIndex = stftBufferCounter;
+
+        stftTimingQueue[stftTimingQueueWriteIndex].elapsedMicroseconds = elapsedMicroseconds;
+
+        stftTimingQueueWriteIndex = nextWriteIndex;
+
+    }
+
+    stftBufferCounter += 1;
+
+}
+
+/* Standalone debug entry point: sample the microphone at a raw, undecimated STFT_SAMPLE_RATE and log the time taken to compute the STFT of each buffer to a text file on the SD card, instead of recording WAV audio */
+
+static void runSTFTFeasibilityTest(void) {
+
+    /* Precompute the Hann analysis window and initialise the FFT */
+
+    for (uint32_t i = 0; i < STFT_FFT_LENGTH; i += 1) {
+
+        stftWindow[i] = 0.5f - 0.5f * cosf(STFT_TWO_PI * (float32_t)i / (float32_t)(STFT_FFT_LENGTH - 1));
+
+    }
+
+    arm_rfft_fast_init_f32(&stftFFTInstance, STFT_FFT_LENGTH);
+
+    /* Wait for the SD card to be present and the log file to open successfully before doing anything else. Without this, a missing/removed SD card leaves the device in an undefined state that is indistinguishable from a hang and only recoverable by re-flashing. The red LED blinks once a second while waiting, and inserting the card lets it recover on its own. */
+
+    bool sdCardReady = false;
+
+    while (sdCardReady == false) {
+
+        bool fileSystemEnabled = AudioMoth_enableFileSystem(AM_SD_CARD_NORMAL_SPEED);
+
+        sdCardReady = fileSystemEnabled && AudioMoth_openFile(STFT_LOG_FILENAME);
+
+        if (sdCardReady == false) {
+
+            AudioMoth_setRedLED(true);
+
+            AudioMoth_delay(100);
+
+            AudioMoth_setRedLED(false);
+
+            AudioMoth_delay(900);
+
+        }
+
+    }
+
+    /* Enable the microphone at a raw, undecimated 16kHz (no software decimation filter) */
+
+    AudioMoth_enableExternalSRAM();
+
+    AudioMoth_ignoreExternalMicrophone(false);
+
+    AudioMoth_enableMicrophone(AM_NORMAL_GAIN_RANGE, AM_GAIN_MEDIUM, 4, 16, 1);
+
+    AudioMoth_initialiseDirectMemoryAccess(primaryBuffer, secondaryBuffer, MAXIMUM_SAMPLES_IN_DMA_TRANSFER);
+
+    /* Write the CSV header now that the file is confirmed open */
+
+    static char lineBuffer[64];
+
+    uint32_t length = sprintf(lineBuffer, "buffer_index,stft_time_us\r\n");
+
+    AudioMoth_writeToFile(lineBuffer, length);
+
+    AudioMoth_syncFile();
+
+    /* Start sampling and continuously drain the timing queue to the SD card */
+
+    stftBufferCounter = 0;
+
+    stftTimingQueueWriteIndex = 0;
+
+    stftTimingQueueReadIndex = 0;
+
+    AudioMoth_startMicrophoneSamples(STFT_SAMPLE_RATE);
+
+    while (true) {
+
+        /* Re-checked every cycle (~64ms) rather than just once at start-up, so that flipping the switch to USB at any time - not only before power-up - still lets the device fall through to the normal USB handling below and be reflashed */
+
+        if (AudioMoth_getSwitchPosition() == AM_SWITCH_USB) {
+
+            AudioMoth_disableMicrophone();
+
+            AudioMoth_closeFile();
+
+            return;
+
+        }
+
+        while (stftTimingQueueReadIndex != stftTimingQueueWriteIndex) {
+
+            stftTimingEntry_t entry = stftTimingQueue[stftTimingQueueReadIndex];
+
+            length = sprintf(lineBuffer, "%lu,%lu\r\n", (unsigned long)entry.bufferIndex, (unsigned long)entry.elapsedMicroseconds);
+
+            AudioMoth_writeToFile(lineBuffer, length);
+
+            AudioMoth_syncFile();
+
+            stftTimingQueueReadIndex = (stftTimingQueueReadIndex + 1) & (STFT_TIMING_QUEUE_LENGTH - 1);
+
+        }
+
+        AudioMoth_sleep();
+
+    }
+
+}
+
+#else
+
 inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, int16_t **nextBuffer) {
 
     int16_t *source = secondaryBuffer;
@@ -2796,6 +3099,8 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
     }
 
 }
+
+#endif
 
 /* AudioMoth USB message handlers */
 
