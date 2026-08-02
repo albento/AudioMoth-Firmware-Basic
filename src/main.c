@@ -16,6 +16,7 @@
 #include "audiomoth.h"
 #include "audioconfig.h"
 #include "digitalfilter.h"
+#include "model_inference.h"
 
 /* STFT feasibility debug mode - set to 0 to restore normal recording firmware */
 
@@ -2795,32 +2796,118 @@ inline void AudioMoth_handleSwitchInterrupt() {
 
 #define STFT_TWO_PI                               6.28318530717958647692f
 
-#define STFT_TIMING_QUEUE_LENGTH                  8
-
 /* Selects how the spectrogram magnitude is scaled, to compare their STFT timing cost against each other */
 
 #define STFT_LOG_MODE_LINEAR                      0
 #define STFT_LOG_MODE_LOG10F                      1
 #define STFT_LOG_MODE_VLOG                        2
+#define STFT_LOG_MODE_LOG10_FIXED                 3
 
-#define STFT_LOG_MODE                             STFT_LOG_MODE_VLOG
+#define STFT_LOG_MODE                             STFT_LOG_MODE_LOG10_FIXED
 
 /* 20/ln(10): converts arm_vlog_f32's natural log output to 20*log10(x) with a single multiply */
 
 #define STFT_20_OVER_LN10                         8.68588963806f
 
+/* round(log10(2) * 65536): Q16.16 fixed-point constant used to turn the fixed-point log2 approximation below into log10 */
+
+#define STFT_LOG2_TO_LOG10_Q16_16                 19728
+
 #if STFT_LOG_MODE == STFT_LOG_MODE_LOG10F
-#define STFT_LOG_FILENAME                         "STFT_TIMING.CSV"
+#define STFT_MODE_SUFFIX                          "LOG10F"
 #elif STFT_LOG_MODE == STFT_LOG_MODE_VLOG
-#define STFT_LOG_FILENAME                         "STFT_TIMING_VLOG.CSV"
+#define STFT_MODE_SUFFIX                          "VLOG"
+#elif STFT_LOG_MODE == STFT_LOG_MODE_LOG10_FIXED
+#define STFT_MODE_SUFFIX                          "LOG10FIXED"
 #else
-#define STFT_LOG_FILENAME                         "STFT_TIMING_NOLOG.CSV"
+#define STFT_MODE_SUFFIX                          "LINEAR"
 #endif
+
+/* CSV just logs buffer_index/elapsed time per buffer, as in the earlier log10f/vlog/linear comparisons - lightweight, no re-flash-free Python inspection. BINARY additionally saves the raw audio and full spectrogram of every buffer (see plot_stft_data.py), at the cost of a much bigger file and a per-buffer copy into external SRAM. */
+
+#define STFT_OUTPUT_MODE_CSV                      0
+#define STFT_OUTPUT_MODE_BINARY                   1
+
+#define STFT_OUTPUT_MODE                          STFT_OUTPUT_MODE_CSV
+
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
+#define STFT_DATA_FILENAME                        "STFT_DATA_" STFT_MODE_SUFFIX ".BIN"
+#else
+#define STFT_DATA_FILENAME                        "STFT_TIMING_" STFT_MODE_SUFFIX ".CSV"
+#endif
+
+#if STFT_LOG_MODE == STFT_LOG_MODE_LOG10_FIXED
+
+/* Fast log10 approximation with no floating point operations beyond reinterpreting the input's bit pattern and converting the final fixed-point result back to a float for storage. Based on the classic IEEE-754 bit-hack: for a positive float32 x, its raw bit pattern i satisfies log2(x) ~= i / 2^23 - 127. Since (i / 2^23) * 2^16 == i >> 7, that gives log2(x) in Q16.16 fixed point (value = integer / 65536) using only a shift and a subtract - no multiplication or division. log10 is then obtained with a single Q16.16 fixed-point multiply by log10(2), instead of the more expensive libm log10f().
+
+   The naive bias of 127 is exact only at powers of two and otherwise always undershoots (the true log2(1+m) curve for mantissa m in [0,1) is concave, so the linear m approximation stays below it), with a worst case of 0.0861 (in log2 units) at m = 1/ln(2) - 1. Using a bias of 127 - 0.0430356660279671 = 126.95696433397204 instead re-centres that error around zero, halving the worst case to 0.0430 - equivalent to roughly 0.26dB instead of 0.52dB on the final 20*log10 result, for no extra cost since it's still a single constant. */
+
+#define STFT_LOG2_BIAS_Q16_16                    8320252  /* round(126.95696433397204 * 65536) */
+
+static inline int32_t stftFastLog2Q16_16(float32_t x) {
+
+    int32_t i;
+
+    memcpy(&i, &x, sizeof(i));
+
+    return (i >> 7) - STFT_LOG2_BIAS_Q16_16;
+
+}
+
+static inline float32_t stftFastLog10(float32_t x) {
+
+    int32_t log2Fixed = stftFastLog2Q16_16(x);
+
+    int32_t log10Fixed = (int32_t)(((int64_t)log2Fixed * STFT_LOG2_TO_LOG10_Q16_16) >> 16);
+
+    return (float32_t)log10Fixed / 65536.0f;
+
+}
+
+#endif
+
+/* Number of records buffered between the ISR (producer) and the main loop (consumer, writes to SD) */
+
+#define STFT_RECORD_QUEUE_LENGTH                  8
+
+#pragma pack(push, 1)
+
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
+
+/* Written once at the start of the file so a Python script can parse it without hard-coding these constants */
+
+typedef struct {
+    uint32_t sampleRate;
+    uint32_t audioLength;
+    uint32_t fftLength;
+    uint32_t hopLength;
+    uint32_t numberOfFrames;
+    uint32_t numberOfBins;
+} stftFileHeader_t;
+
+/* One record per buffer: the raw audio that produced the spectrogram, alongside the spectrogram itself and how long it took to compute */
 
 typedef struct {
     uint32_t bufferIndex;
     uint32_t elapsedMicroseconds;
-} stftTimingEntry_t;
+    int16_t audio[MAXIMUM_SAMPLES_IN_DMA_TRANSFER];
+    float32_t spectrogram[STFT_NUMBER_OF_FRAMES][STFT_NUMBER_OF_BINS];
+} stftRecord_t;
+
+#else
+
+/* CSV mode only ever needs the timing of each buffer */
+
+typedef struct {
+    uint32_t bufferIndex;
+    uint32_t elapsedMicroseconds;
+    uint32_t inferenceMicroseconds;
+    ModelInferenceTiming_t modelTiming;
+} stftRecord_t;
+
+#endif
+
+#pragma pack(pop)
 
 static arm_rfft_fast_instance_f32 stftFFTInstance;
 
@@ -2832,15 +2919,27 @@ static float32_t stftFFTOutput[STFT_FFT_LENGTH];
 
 static float32_t stftMagnitude[STFT_NUMBER_OF_BINS];
 
-/* Log-magnitude spectrogram of the buffer currently being processed. Declared volatile so the compiler cannot optimise away the STFT computation that fills it. */
+/* Spectrogram of the buffer currently being processed. In BINARY output mode this is genuinely read (copied into a record below), but in CSV mode nothing ever reads it back - so it must stay volatile, otherwise the compiler proves the whole magnitude/log computation feeding it is dead and removes it, silently invalidating any timing measurement. */
 
 static volatile float32_t stftSpectrogramDb[STFT_NUMBER_OF_FRAMES][STFT_NUMBER_OF_BINS];
 
-static volatile stftTimingEntry_t stftTimingQueue[STFT_TIMING_QUEUE_LENGTH];
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
 
-static volatile uint32_t stftTimingQueueWriteIndex;
+/* Record queue lives in external SRAM - each record (~5.5KB) is far too large for the 32KB of internal RAM to hold more than one or two */
 
-static volatile uint32_t stftTimingQueueReadIndex;
+static stftRecord_t *stftRecordQueue = (stftRecord_t*)AM_EXTERNAL_SRAM_START_ADDRESS;
+
+#else
+
+/* CSV records are tiny (8 bytes), internal RAM is fine */
+
+static stftRecord_t stftRecordQueue[STFT_RECORD_QUEUE_LENGTH];
+
+#endif
+
+static volatile uint32_t stftRecordQueueWriteIndex;
+
+static volatile uint32_t stftRecordQueueReadIndex;
 
 static volatile uint32_t stftBufferCounter;
 
@@ -2910,6 +3009,22 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
         }
 
+#elif STFT_LOG_MODE == STFT_LOG_MODE_LOG10_FIXED
+
+        stftSpectrogramDb[frame][0] = 20.0f * stftFastLog10(fabsf(stftFFTOutput[0]) + STFT_LOG_EPSILON);
+
+        stftSpectrogramDb[frame][STFT_FFT_LENGTH / 2] = 20.0f * stftFastLog10(fabsf(stftFFTOutput[1]) + STFT_LOG_EPSILON);
+
+        for (uint32_t bin = 1; bin < STFT_FFT_LENGTH / 2; bin += 1) {
+
+            float32_t re = stftFFTOutput[2 * bin];
+
+            float32_t im = stftFFTOutput[2 * bin + 1];
+
+            stftSpectrogramDb[frame][bin] = 20.0f * stftFastLog10(sqrtf(re * re + im * im) + STFT_LOG_EPSILON);
+
+        }
+
 #else
 
         stftSpectrogramDb[frame][0] = fabsf(stftFFTOutput[0]);
@@ -2936,15 +3051,53 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     uint32_t elapsedMicroseconds = (endTime - startTime) * MICROSECONDS_IN_SECOND + endMicroseconds - startMicroseconds;
 
-    uint32_t nextWriteIndex = (stftTimingQueueWriteIndex + 1) & (STFT_TIMING_QUEUE_LENGTH - 1);
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_CSV
 
-    if (nextWriteIndex != stftTimingQueueReadIndex) {
+    /* Runs the exported classifier on the buffer just computed, timed separately from the STFT above so elapsedMicroseconds stays comparable with every earlier STFT-only measurement. Still in the ISR, like the STFT itself - the point of this test is exactly whether inference also fits in the 64ms budget, which only a real ISR-context measurement answers. The logit isn't used for anything yet - this is a timing test only. */
 
-        stftTimingQueue[stftTimingQueueWriteIndex].bufferIndex = stftBufferCounter;
+    uint32_t inferenceStartTime, inferenceStartMicroseconds;
 
-        stftTimingQueue[stftTimingQueueWriteIndex].elapsedMicroseconds = elapsedMicroseconds;
+    AudioMoth_getTimeMicroseconds(&inferenceStartTime, &inferenceStartMicroseconds);
 
-        stftTimingQueueWriteIndex = nextWriteIndex;
+    ModelInferenceTiming_t modelTiming;
+
+    float modelLogit = ModelInference_run(stftSpectrogramDb, &modelTiming);
+
+    (void)modelLogit;
+
+    uint32_t inferenceEndTime, inferenceEndMicroseconds;
+
+    AudioMoth_getTimeMicroseconds(&inferenceEndTime, &inferenceEndMicroseconds);
+
+    uint32_t inferenceMicroseconds = (inferenceEndTime - inferenceStartTime) * MICROSECONDS_IN_SECOND + inferenceEndMicroseconds - inferenceStartMicroseconds;
+
+#endif
+
+    /* In binary mode, the raw audio and the spectrogram just computed are also copied into the next free record. That copy (a few KB to external SRAM) happens after elapsedMicroseconds is captured, so that value still reflects only the STFT computation, comparable with earlier measurements. */
+
+    uint32_t nextWriteIndex = (stftRecordQueueWriteIndex + 1) & (STFT_RECORD_QUEUE_LENGTH - 1);
+
+    if (nextWriteIndex != stftRecordQueueReadIndex) {
+
+        stftRecordQueue[stftRecordQueueWriteIndex].bufferIndex = stftBufferCounter;
+
+        stftRecordQueue[stftRecordQueueWriteIndex].elapsedMicroseconds = elapsedMicroseconds;
+
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
+
+        memcpy(stftRecordQueue[stftRecordQueueWriteIndex].audio, source, sizeof(stftRecordQueue[0].audio));
+
+        memcpy(stftRecordQueue[stftRecordQueueWriteIndex].spectrogram, stftSpectrogramDb, sizeof(stftRecordQueue[0].spectrogram));
+
+#else
+
+        stftRecordQueue[stftRecordQueueWriteIndex].inferenceMicroseconds = inferenceMicroseconds;
+
+        stftRecordQueue[stftRecordQueueWriteIndex].modelTiming = modelTiming;
+
+#endif
+
+        stftRecordQueueWriteIndex = nextWriteIndex;
 
     }
 
@@ -2974,7 +3127,7 @@ static void runSTFTFeasibilityTest(void) {
 
         bool fileSystemEnabled = AudioMoth_enableFileSystem(AM_SD_CARD_NORMAL_SPEED);
 
-        sdCardReady = fileSystemEnabled && AudioMoth_openFile(STFT_LOG_FILENAME);
+        sdCardReady = fileSystemEnabled && AudioMoth_openFile(STFT_DATA_FILENAME);
 
         if (sdCardReady == false) {
 
@@ -3000,23 +3153,42 @@ static void runSTFTFeasibilityTest(void) {
 
     AudioMoth_initialiseDirectMemoryAccess(primaryBuffer, secondaryBuffer, MAXIMUM_SAMPLES_IN_DMA_TRANSFER);
 
-    /* Write the CSV header now that the file is confirmed open */
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
 
-    static char lineBuffer[64];
+    /* Write the file header now that the file is confirmed open, so a Python script can parse the rest without hard-coding these constants */
 
-    uint32_t length = sprintf(lineBuffer, "buffer_index,stft_time_us\r\n");
+    static const stftFileHeader_t stftFileHeader = {
+        .sampleRate = STFT_SAMPLE_RATE,
+        .audioLength = MAXIMUM_SAMPLES_IN_DMA_TRANSFER,
+        .fftLength = STFT_FFT_LENGTH,
+        .hopLength = STFT_HOP_LENGTH,
+        .numberOfFrames = STFT_NUMBER_OF_FRAMES,
+        .numberOfBins = STFT_NUMBER_OF_BINS
+    };
 
-    AudioMoth_writeToFile(lineBuffer, length);
+    AudioMoth_writeToFile((void*)&stftFileHeader, sizeof(stftFileHeader));
+
+#else
+
+    static char lineBuffer[192];
+
+    uint32_t lineLength = sprintf(lineBuffer, "buffer_index,stft_time_us,inference_time_us,stage0_us,stage1_dw_us,stage1_pw_us,stage2_dw_us,stage2_pw_us,avgpool_us,lstm_us,classifier_us\r\n");
+
+    AudioMoth_writeToFile(lineBuffer, lineLength);
+
+#endif
 
     AudioMoth_syncFile();
 
-    /* Start sampling and continuously drain the timing queue to the SD card */
+    /* Start sampling and continuously drain the record queue to the SD card */
 
     stftBufferCounter = 0;
 
-    stftTimingQueueWriteIndex = 0;
+    stftRecordQueueWriteIndex = 0;
 
-    stftTimingQueueReadIndex = 0;
+    stftRecordQueueReadIndex = 0;
+
+    ModelInference_reset();
 
     AudioMoth_startMicrophoneSamples(STFT_SAMPLE_RATE);
 
@@ -3034,17 +3206,34 @@ static void runSTFTFeasibilityTest(void) {
 
         }
 
-        while (stftTimingQueueReadIndex != stftTimingQueueWriteIndex) {
+        while (stftRecordQueueReadIndex != stftRecordQueueWriteIndex) {
 
-            stftTimingEntry_t entry = stftTimingQueue[stftTimingQueueReadIndex];
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
 
-            length = sprintf(lineBuffer, "%lu,%lu\r\n", (unsigned long)entry.bufferIndex, (unsigned long)entry.elapsedMicroseconds);
+            AudioMoth_writeToFile(&stftRecordQueue[stftRecordQueueReadIndex], sizeof(stftRecord_t));
 
-            AudioMoth_writeToFile(lineBuffer, length);
+#else
+
+            lineLength = sprintf(lineBuffer, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].bufferIndex,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].elapsedMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].inferenceMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage0Microseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage1DepthwiseMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage1PointwiseMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage2DepthwiseMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage2PointwiseMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.avgPoolMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.lstmMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.classifierMicroseconds);
+
+            AudioMoth_writeToFile(lineBuffer, lineLength);
+
+#endif
 
             AudioMoth_syncFile();
 
-            stftTimingQueueReadIndex = (stftTimingQueueReadIndex + 1) & (STFT_TIMING_QUEUE_LENGTH - 1);
+            stftRecordQueueReadIndex = (stftRecordQueueReadIndex + 1) & (STFT_RECORD_QUEUE_LENGTH - 1);
 
         }
 
