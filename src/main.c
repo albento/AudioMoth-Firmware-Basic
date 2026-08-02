@@ -3170,7 +3170,7 @@ static void runSTFTFeasibilityTest(void) {
 
 #else
 
-    static char lineBuffer[192];
+    static char lineBuffer[224];
 
     uint32_t lineLength = sprintf(lineBuffer, "buffer_index,stft_time_us,inference_time_us,stage0_us,stage1_dw_us,stage1_pw_us,stage2_dw_us,stage2_pw_us,avgpool_us,lstm_us,classifier_us\r\n");
 

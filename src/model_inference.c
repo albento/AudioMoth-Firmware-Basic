@@ -51,13 +51,11 @@ static int8_t inputBuffer[MODEL_INFERENCE_INPUT_BINS * MODEL_INFERENCE_INPUT_FRA
 
 static int8_t pooledBuffer[MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_SIZE];
 
-/* Shared scratch buffer, reused sequentially (never concurrently) by both runConv() and
-   runDepthwiseConv() - sized for the largest single requirement across all five stages.
-   arm_convolve_s8's im2col-style need (2 * roundup4(kH*kW*Cin) * sizeof(int16_t)) tops out
-   at 128 bytes (stage2_pw). arm_depthwise_conv_s8_opt's need
-   (Cin * kH * kW * sizeof(int16_t), confirmed from
-   arm_depthwise_conv_s8_opt_get_buffer_size_dsp()) tops out at stage2_dw: 32*3*3*2 = 576
-   bytes - the largest of the two, so it sizes the buffer. */
+/* Scratch buffer for runDepthwiseConv()'s arm_depthwise_conv_s8_opt call - the only
+   remaining user now that stage0/stage1_pw/stage2_pw are hand-written and no longer call
+   arm_convolve_s8 (see runStage0Conv()/runPointwiseConv() below). Sized for the largest of
+   the two depthwise stages: Cin * kH * kW * sizeof(int16_t) (confirmed from
+   arm_depthwise_conv_s8_opt_get_buffer_size_dsp()), 32*3*3*2 = 576 bytes for stage2_dw. */
 
 static int16_t convScratchBuffer[288];
 
@@ -78,28 +76,107 @@ void ModelInference_reset(void) {
 
 }
 
-/* Regular (groups=1) or pointwise (1x1) convolution via arm_convolve_s8, ReLU-fused
-   (every stage in this model is Conv+BatchNorm+ReLU, BatchNorm already folded into the
-   weights/bias at export time - see export_int8.py's fold_conv_bn()). Tried routing
-   through arm_convolve_wrapper_s8 to get arm_convolve_1x1_s8_fast (im2col-free,
-   arm_nn_mat_mult_nt_t_s8) for the two pointwise stages - measured SLOWER on real hardware
-   (stage1_pw +41%, stage2_pw +75%), not faster as the source comments suggested. Reverted;
-   arm_convolve_s8 is the measured-best option here. */
+/* Hand-written replacement for stage0 (in_ch=1, 3x3, stride 2, pad 1), which
+   arm_convolve_s8 spent most of its time on not because of the arithmetic (37440 MACs is
+   tiny) but because of its im2col gathering step: with kernel_ch=1, every one of the 2340
+   (65*4 output positions x 9 kernel taps) im2col writes is a 1-byte arm_memcpy_s8/
+   arm_memset_s8 call, and neither is MVE-accelerated on this core (Cortex-M4, no MVE) so
+   each one is a genuine call into libc's generic memcpy()/memset() to move a single byte -
+   see EXPERIMENTS.md. Since convParams.input_offset is 0 for every stage in this model, a
+   padded tap contributes input_offset*weight = 0 to the sum either way, so padding taps can
+   just be skipped instead of memset - no im2col buffer is needed at all when in_ch=1, the
+   9 taps can be read directly from the input tensor. Requantization goes through the exact
+   same arm_nn_requantize() CMSIS-NN uses internally, so this is bit-identical to
+   arm_convolve_s8's output, just without the im2col overhead - not an approximation. */
+
+static void runStage0Conv(const int8_t *input, int8_t *output) {
+
+    const int8_t *weight = model_int8_lstm_small_16_focal_stage0_weight;
+    const int32_t *bias = model_int8_lstm_small_16_focal_stage0_bias;
+    const int32_t *multiplier = model_int8_lstm_small_16_focal_stage0_multiplier;
+    const int32_t *shift = model_int8_lstm_small_16_focal_stage0_shift;
+
+    const int32_t kernel = MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_KERNEL;
+    const int32_t stride = MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_STRIDE;
+    const int32_t padding = MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_PADDING;
+    const int32_t outCh = MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_OUT_CH;
+
+    int32_t oh, ow, oc, ky, kx;
+
+    for (oh = 0; oh < STAGE0_OUT_H; oh += 1) {
+
+        int32_t iyBase = oh * stride - padding;
+
+        for (ow = 0; ow < STAGE0_OUT_W; ow += 1) {
+
+            int32_t ixBase = ow * stride - padding;
+
+            int8_t *outPixel = output + (oh * STAGE0_OUT_W + ow) * outCh;
+
+            for (oc = 0; oc < outCh; oc += 1) {
+
+                int32_t sum = bias[oc];
+
+                const int8_t *w = weight + oc * kernel * kernel;
+
+                for (ky = 0; ky < kernel; ky += 1) {
+
+                    int32_t iy = iyBase + ky;
+
+                    if (iy < 0 || iy >= MODEL_INFERENCE_INPUT_BINS) continue;
+
+                    for (kx = 0; kx < kernel; kx += 1) {
+
+                        int32_t ix = ixBase + kx;
+
+                        if (ix < 0 || ix >= MODEL_INFERENCE_INPUT_FRAMES) continue;
+
+                        sum += (int32_t)input[iy * MODEL_INFERENCE_INPUT_FRAMES + ix] * (int32_t)w[ky * kernel + kx];
+
+                    }
+
+                }
+
+                sum = arm_nn_requantize(sum, multiplier[oc], shift[oc]);
+                sum = MAX(sum, 0);
+                sum = MIN(sum, 127);
+
+                outPixel[oc] = (int8_t)sum;
+
+            }
+
+        }
+
+    }
+
+}
+
+/* Pointwise (1x1, stride 1, pad 0) convolution via arm_convolve_s8. Tried a hand-written
+   replacement mirroring runStage0Conv() above - skip the im2col memcpy, feed
+   arm_s8_to_s16_unordered_with_offset()/arm_nn_mat_mult_kernel_s8_s16() directly (same
+   approach, verified bit-exact against arm_convolve_s8 with an on-device check, 0
+   mismatches). stage1_pw did get faster in isolation (-7%), but stage2_pw got measurably
+   slower (+10%) and, surprisingly, so did stage0 (+14%) despite not touching it - the net
+   effect across the whole pipeline was ~1.1ms SLOWER, not faster (32928 -> 34027us
+   inference). Best explanation: changing which functions exist/how large they are shifts
+   .text layout enough to change flash-prefetch behaviour for unrelated code - a real,
+   measured effect on this target, not something visible from source alone. Reverted;
+   arm_convolve_s8 is the measured-best option for these two stages, same conclusion as the
+   arm_convolve_wrapper_s8 attempt above. */
 
 static void runConv(const int8_t *input, int8_t *output, const int8_t *weight, const int32_t *bias,
                      const int32_t *multiplier, const int32_t *shift, int32_t inCh, int32_t outCh,
-                     int32_t inH, int32_t inW, int32_t outH, int32_t outW, int32_t kernel,
-                     int32_t stride, int32_t padding) {
+                     int32_t numPositions) {
 
     cmsis_nn_context ctx = { convScratchBuffer, sizeof(convScratchBuffer) };
 
     cmsis_nn_conv_params convParams;
     convParams.input_offset = 0;
     convParams.output_offset = 0;
-    convParams.stride.h = stride;
-    convParams.stride.w = stride;
-    convParams.padding.h = padding;
-    convParams.padding.w = padding;
+    convParams.stride.h = 1;
+    convParams.stride.w = 1;
+    convParams.padding.h = 0;
+    convParams.padding.w = 0;
     convParams.dilation.h = 1;
     convParams.dilation.w = 1;
     convParams.activation.min = 0;
@@ -109,10 +186,10 @@ static void runConv(const int8_t *input, int8_t *output, const int8_t *weight, c
     quantParams.multiplier = (int32_t*)multiplier;
     quantParams.shift = (int32_t*)shift;
 
-    cmsis_nn_dims inputDims = { 1, inH, inW, inCh };
-    cmsis_nn_dims filterDims = { outCh, kernel, kernel, inCh };
+    cmsis_nn_dims inputDims = { 1, numPositions, 1, inCh };
+    cmsis_nn_dims filterDims = { outCh, 1, 1, inCh };
     cmsis_nn_dims biasDims = { 1, 1, 1, outCh };
-    cmsis_nn_dims outputDims = { 1, outH, outW, outCh };
+    cmsis_nn_dims outputDims = { 1, numPositions, 1, outCh };
 
     arm_convolve_s8(&ctx, &convParams, &quantParams, &inputDims, input, &filterDims, weight,
                      &biasDims, bias, NULL, &outputDims, output);
@@ -120,7 +197,8 @@ static void runConv(const int8_t *input, int8_t *output, const int8_t *weight, c
 }
 
 /* Depthwise convolution (groups == channels, channel multiplier 1) via
-   arm_depthwise_conv_s8_opt - same ReLU fusion as runConv() above. Deliberately NOT
+   arm_depthwise_conv_s8_opt - same ReLU fusion (Conv+BatchNorm+ReLU folded at export time)
+   as every other stage here. Deliberately NOT
    arm_depthwise_conv_s8: profiling showed that function falls back to a fully scalar,
    non-SIMD path whenever ch_mult != 4 (confirmed from its source, depthwise_conv_s8_generic
    is used unless ch_mult%4==0, which never holds for this model's plain, channel-preserving
@@ -327,13 +405,7 @@ float ModelInference_run(const float spectrogram[MODEL_INFERENCE_INPUT_FRAMES][M
 
     quantizeInput(spectrogram);
 
-    TIME_STAGE(stage0Microseconds, runConv(inputBuffer, activationBufferA,
-            model_int8_lstm_small_16_focal_stage0_weight, model_int8_lstm_small_16_focal_stage0_bias,
-            model_int8_lstm_small_16_focal_stage0_multiplier, model_int8_lstm_small_16_focal_stage0_shift,
-            MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_IN_CH, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_OUT_CH,
-            MODEL_INFERENCE_INPUT_BINS, MODEL_INFERENCE_INPUT_FRAMES, STAGE0_OUT_H, STAGE0_OUT_W,
-            MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_KERNEL, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_STRIDE,
-            MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_PADDING))
+    TIME_STAGE(stage0Microseconds, runStage0Conv(inputBuffer, activationBufferA))
 
     TIME_STAGE(stage1DepthwiseMicroseconds, runDepthwiseConv(activationBufferA, activationBufferB,
                       model_int8_lstm_small_16_focal_stage1_dw_weight, model_int8_lstm_small_16_focal_stage1_dw_bias,
@@ -347,9 +419,7 @@ float ModelInference_run(const float spectrogram[MODEL_INFERENCE_INPUT_FRAMES][M
             model_int8_lstm_small_16_focal_stage1_pw_weight, model_int8_lstm_small_16_focal_stage1_pw_bias,
             model_int8_lstm_small_16_focal_stage1_pw_multiplier, model_int8_lstm_small_16_focal_stage1_pw_shift,
             MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_PW_IN_CH, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_PW_OUT_CH,
-            STAGE1_DW_OUT_H, STAGE1_DW_OUT_W, STAGE1_PW_OUT_H, STAGE1_PW_OUT_W,
-            MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_PW_KERNEL, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_PW_STRIDE,
-            MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_PW_PADDING))
+            STAGE1_PW_OUT_H * STAGE1_PW_OUT_W))
 
     TIME_STAGE(stage2DepthwiseMicroseconds, runDepthwiseConv(activationBufferA, activationBufferB,
                       model_int8_lstm_small_16_focal_stage2_dw_weight, model_int8_lstm_small_16_focal_stage2_dw_bias,
@@ -363,9 +433,7 @@ float ModelInference_run(const float spectrogram[MODEL_INFERENCE_INPUT_FRAMES][M
             model_int8_lstm_small_16_focal_stage2_pw_weight, model_int8_lstm_small_16_focal_stage2_pw_bias,
             model_int8_lstm_small_16_focal_stage2_pw_multiplier, model_int8_lstm_small_16_focal_stage2_pw_shift,
             MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_PW_IN_CH, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_PW_OUT_CH,
-            STAGE2_DW_OUT_H, STAGE2_DW_OUT_W, STAGE2_PW_OUT_H, STAGE2_PW_OUT_W,
-            MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_PW_KERNEL, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_PW_STRIDE,
-            MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_PW_PADDING))
+            STAGE2_PW_OUT_H * STAGE2_PW_OUT_W))
 
     TIME_STAGE(avgPoolMicroseconds, runAvgPoolFreq(activationBufferA, pooledBuffer, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_PW_OUT_CH,
                    STAGE2_PW_OUT_H, STAGE2_PW_OUT_W))

@@ -144,6 +144,7 @@ longer clip.
 | Full model integrated (first working build) | 234816 | ~10.7KB | 27400 | ~5.2KB |
 | + per-stage timing instrumentation | 235456 | ~10.1KB | 27800 | ~4.9KB |
 | + `arm_depthwise_conv_s8_opt` (kept) | 235296 | ~10.5KB | 28248 | ~4.4KB |
+| + hand-written `runStage0Conv` (kept) | 236544 | ~9.0KB | 28280 | ~4.4KB |
 
 Tight but fits at every step, verified by building and reading `arm-none-eabi-size` output
 after each change rather than assumed - the model's own weight/param data is only ~10.5KB,
@@ -154,11 +155,13 @@ but CMSIS-NN kernel code (im2col, matmul, requantize) adds meaningfully more.
 | Model code path | STFT | Inference | Total | % of 64ms budget |
 |---|---|---|---|---|
 | Before depthwise optimization | 4486 µs | 43579 µs | 48065 µs | 75.1% |
-| **After `arm_depthwise_conv_s8_opt` (kept)** | **4486 µs** | **40466 µs** | **44952 µs** | **70.2%** |
+| After `arm_depthwise_conv_s8_opt` | 4486 µs | 40466 µs | 44952 µs | 70.2% |
+| **After hand-written `runStage0Conv` (kept)** | **4486 µs** | **32868 µs** | **37354 µs** | **58.4%** |
 
-Model inference dominates the buffer's compute cost by roughly 9x over the STFT itself, but
-the combined pipeline still fits with margin (~29.8% of the 64ms budget free after the
-depthwise optimization, up from ~24.9%).
+Model inference dominates the buffer's compute cost, but the combined pipeline fits with
+margin to spare - ~41.6% of the 64ms budget free after both kept optimizations, up from
+~24.9% at the first working build. Both wins came from *how* the existing CMSIS-NN kernels
+are invoked, not from changing the model or its weights.
 
 ### Stage-by-stage profiling breakdown
 
@@ -167,17 +170,17 @@ Added a `ModelInferenceTiming_t` struct (`inc/model_inference.h`) filled in by
 classifier in a `TIME_STAGE` macro, and extended the CSV with 8 columns
 (`stage0_us,stage1_dw_us,stage1_pw_us,stage2_dw_us,stage2_pw_us,avgpool_us,lstm_us,classifier_us`).
 
-| Stage | Before (µs) | % | After `arm_depthwise_conv_s8_opt` (µs) | % |
-|---|---|---|---|---|
-| stage0 (regular conv, in_ch=1) | 16601 | 38.1% | 16632 | 41.1% |
-| stage1_dw (depthwise) | 9583 | 22.0% | **7141** | 17.6% |
-| stage1_pw (pointwise 1x1) | 6744 | 15.5% | 6745 | 16.7% |
-| stage2_dw (depthwise) | 4395 | 10.1% | **3449** | 8.5% |
-| stage2_pw (pointwise 1x1) | 4211 | 9.7% | 4211 | 10.4% |
-| avgpool | 244 | 0.6% | 244 | 0.6% |
-| LSTM step | 702 | 1.6% | 702 | 1.7% |
-| classifier | 0 | 0.0% | 0 | 0.0% |
-| (unaccounted: quantize/transpose, not instrumented) | ~1099 | 2.5% | ~1342 | 3.3% |
+| Stage | Before (µs) | % | After `arm_depthwise_conv_s8_opt` (µs) | % | After `runStage0Conv` (µs) | % |
+|---|---|---|---|---|---|---|
+| stage0 (regular conv, in_ch=1) | 16601 | 38.1% | 16632 | 41.1% | **9063** | 27.6% |
+| stage1_dw (depthwise) | 9583 | 22.0% | **7141** | 17.6% | 7141 | 21.7% |
+| stage1_pw (pointwise 1x1) | 6744 | 15.5% | 6745 | 16.7% | 6805 | 20.7% |
+| stage2_dw (depthwise) | 4395 | 10.1% | **3449** | 8.5% | 3449 | 10.5% |
+| stage2_pw (pointwise 1x1) | 4211 | 9.7% | 4211 | 10.4% | 4242 | 12.9% |
+| avgpool | 244 | 0.6% | 244 | 0.6% | 244 | 0.7% |
+| LSTM step | 702 | 1.6% | 702 | 1.7% | 672 | 2.0% |
+| classifier | 0 | 0.0% | 0 | 0.0% | 0 | 0.0% |
+| (unaccounted: quantize/transpose, not instrumented) | ~1099 | 2.5% | ~1342 | 3.3% | ~1252 | 3.8% |
 
 The 5 conv/depthwise stages account for ~95% of inference time; LSTM and the classifier are
 negligible (a 16-element dot product and a single LSTM step over a 16-wide hidden state are
@@ -203,6 +206,30 @@ stages), reused from the same buffer already shared with `runConv()`'s im2col sc
 Result: stage1_dw -25.5% (9583 -> 7141 µs), stage2_dw -21.5% (4395 -> 3449 µs), total
 inference -7.1% (43579 -> 40466 µs). Confirmed on real hardware, not simulated.
 
+### Hand-written `runStage0Conv`: bypassing im2col for in_ch=1
+
+With `arm_convolve_wrapper_s8` ruled out (below), stage0 (in_ch=1, kernel 3x3, stride 2,
+pad 1) remained the largest single cost at ~41% of inference. Root cause, read directly from
+`arm_convolve_s8.c`: with `kernel_ch=1`, every one of the 2340 (65*4 output positions x 9
+kernel taps) im2col writes is a 1-byte `arm_memcpy_s8`/`arm_memset_s8` call - and on Cortex-M4
+(no MVE), both are just wrappers around libc's generic `memcpy()`/`memset()`, real function
+calls to move a single byte each. The arithmetic itself is tiny (37440 MACs) and was never
+the bottleneck.
+
+Fix: a hand-written `runStage0Conv()` that reads the 3x3 window directly from the input
+tensor with no im2col buffer at all. Two things make this safe rather than an approximation:
+`convParams.input_offset` is 0 for every stage in this model, so a padded tap contributes
+`input_offset*weight = 0` either way - padding taps can just be skipped instead of memset;
+and requantization goes through the exact same `arm_nn_requantize()` CMSIS-NN uses
+internally. **Verified bit-exact** against `arm_convolve_s8` with a native x86 test (200
+random trials, byte-identical output) before ever touching hardware - possible here because
+this replacement is plain portable C, unlike the pointwise attempt below which depends on
+ARM-only DSP intrinsics that don't compile on x86.
+
+Result: stage0 -45% (16632 -> 9063 µs), total inference -18.6% (40466 -> 32868 µs), total
+buffer -16.9% (44952 -> 37354 µs). The single biggest win of this whole investigation, and
+it needed no CMSIS-NN "opt" variant to exist for this shape - none does.
+
 ### Rejected optimization: `arm_convolve_wrapper_s8` for the pointwise stages
 
 Hypothesis: since `stage1_pw`/`stage2_pw` are 1x1/stride-1/pad-0 convolutions,
@@ -218,9 +245,40 @@ its source (skips a whole processing step) is not automatically faster on this s
 core/compiler/shape combination - measure on hardware before keeping a change, the same
 discipline that caught the `ARM_MATH_DSP` no-op above.
 
-stage0 (the largest remaining single cost, ~41% of inference) has no equivalent CMSIS-NN
-"opt" variant for its exact shape (in_ch=1, kernel=3x3, stride=2) - not yet investigated
-further given the above result.
+### Rejected optimization: hand-written pointwise conv (correct, but net negative)
+
+After `runStage0Conv()` worked, tried the same im2col-skipping idea on `stage1_pw`/
+`stage2_pw`, but keeping CMSIS-NN's own SIMD dot-product kernel this time instead of a naive
+scalar loop (unlike stage0, these have up to 34K MACs, not trivial): call
+`arm_s8_to_s16_unordered_with_offset()` directly on the input (a 1x1/stride-1/pad-0 im2col
+"row" is already exactly the input's contiguous per-position channel vector - no gathering
+needed) and feed it straight into `arm_nn_mat_mult_kernel_s8_s16()`, the same function
+`arm_convolve_s8` already calls internally - just without the redundant memcpy in between.
+
+Correctness was confirmed **on real hardware** first this time (not just x86), since these
+two support functions depend on ARM DSP inline assembly (`SXTAB16`, `SMLAD`, `PKHBT`) that
+won't compile or run on x86: a temporary on-device check ran both the new and old
+(`arm_convolve_s8`) paths on every buffer and counted mismatched bytes into two extra CSV
+columns (`pw1_mismatch`, `pw2_mismatch`) - confirmed 0 mismatches across ~149 buffers before
+trusting the timing numbers.
+
+Timing was mixed and, net, worse: stage1_pw did improve in isolation (6805 -> 6317 µs,
+-7.2%), but stage2_pw got slower (4242 -> 4639 µs, +9.4%) and - unexpectedly, since it was
+never touched in this change - so did **stage0** (9063 -> 10437 µs, +15.2%). Total inference
+went from 32868 to 34027 µs, ~1.2ms *slower* overall, despite the stage1_pw win. Best
+explanation: adding/removing functions shifts `.text` layout enough to change flash-prefetch
+behaviour for unrelated code on this target - a real, measured side effect, not visible from
+reading the source of any individual function. Reverted both stages back to `arm_convolve_s8`
+(the same function used in the `runConv()` helper before this attempt), which restored
+stage0 to 9063 µs and inference to 32868 µs, confirming the layout-sensitivity theory rather
+than a fluke.
+
+**Takeaway for this codebase**: a correctness-verified, individually-faster kernel swap can
+still make the *overall* pipeline slower once linked into the real binary. The only way to
+know is to measure the whole pipeline on real hardware after each change, not just the stage
+being changed - this is the second time in this investigation a "should be faster from
+reading the source" change measured worse (see `arm_convolve_wrapper_s8` above), and the
+first time changing one stage measurably moved an unrelated stage's timing.
 
 ### Timer resolution caveat for reading these CSVs
 
