@@ -84,9 +84,19 @@ feature-parity: `scripts/fast_log10.py`.
   discussed as a future option, no information loss unlike the "single reused row" alternative
   which was ruled out for real classifier use since it would discard all past frames).
 - CMSIS-DSP's generic `arm_rfft_fast_init_f32()` statically references twiddle tables for every
-  supported FFT size (16 to 4096), costing ~64KB of otherwise-unreachable flash even though only
-  256 is used; the fix (call the size-specific `arm_rfft_fast_init_256_f32()` instead) was
-  identified but not yet applied.
+  supported FFT size (16 to 4096), costing otherwise-unreachable flash even though only 256 is
+  used - `arm_rfft_fast_init_f32()` is a switch-case dispatcher over every size, and since it
+  takes the length as a runtime argument (even though this call site always passes the same
+  compile-time constant), the compiler can't prove which case executes, so `--gc-sections` can't
+  strip the other sizes' tables. Fixed by calling the size-specific `arm_rfft_fast_init_256_f32()`
+  directly instead (already existed in CMSIS-DSP, no dispatch) - confirmed via the linker's
+  symbol table (`arm-none-eabi-nm --print-size --size-sort`) that every `twiddleCoef_*`/
+  `armBitRevIndexTable*` table above 256 points (512/1024/2048/4096, each pair costing 2-16KB)
+  disappeared from the link. Real measured saving: `.text` 235280 -> 158472 bytes, **-76808
+  bytes (~75KB)** - bigger than the ~64KB first estimated, since some of the dispatcher's own
+  supporting code also became unreachable. Flash margin after the model integration (see below)
+  went from ~9.4KB to ~84.2KB. A compile-time `#error` guards the 256-only assumption in case
+  `STFT_FFT_LENGTH` ever changes without updating this call to match.
 - Architectural note for the eventual classifier: a streaming/recurrent model (GRU/LSTM, backed
   by CMSIS-NN's `LSTMFunctions`) could consume one frame (129 values) at a time and only needs a
   small persistent hidden state - no need to buffer multiple frames. A 2D-CNN-over-spectrogram
@@ -145,10 +155,14 @@ longer clip.
 | + per-stage timing instrumentation | 235456 | ~10.1KB | 27800 | ~4.9KB |
 | + `arm_depthwise_conv_s8_opt` (kept) | 235296 | ~10.5KB | 28248 | ~4.4KB |
 | + hand-written `runStage0Conv` (kept) | 236544 | ~9.0KB | 28280 | ~4.4KB |
+| + `arm_rfft_fast_init_256_f32()` fix (kept) | 159568 | **~84.2KB** | 27712 | ~4.9KB |
 
-Tight but fits at every step, verified by building and reading `arm-none-eabi-size` output
+Tight through every step above, verified by building and reading `arm-none-eabi-size` output
 after each change rather than assumed - the model's own weight/param data is only ~10.5KB,
-but CMSIS-NN kernel code (im2col, matmul, requantize) adds meaningfully more.
+but CMSIS-NN kernel code (im2col, matmul, requantize) adds meaningfully more. The last row
+(see the FFT init fix above) changes that picture entirely: ~75KB of flash that was never
+actually reachable code came free just from calling the right init function, most of a whole
+extra model's worth of budget freed up without touching the model itself.
 
 ### Results: end-to-end timing (real hardware, 94-124 buffers per run)
 
@@ -291,6 +305,160 @@ of real work) reads as 0 most of the time and ~30-31 µs occasionally (whichever
 tick boundary the start/end samples land on), and why every other per-stage column jitters
 in ~30 µs steps between runs of the same buffer - real execution time is stable, the
 apparent jitter is clock quantization, not measurement noise.
+
+## Device-vs-PC numerical parity (STFT, RMS normalization, and INT8 model bugs)
+
+After the model ran end-to-end on-device (previous section), the next question was whether it
+computed the *right* thing, not just something fast: `test-audiomoth-cnn/compare_device_output.py`
+rebuilds the exact `QuantizedModel` `export_int8.py` exported (same checkpoint/calibration) and
+replays the firmware's own captured spectrograms (`STFT_OUTPUT_MODE_BINARY`) through
+`int8_sim.py`'s kernels, carrying LSTM state across buffers the same way `ModelInference_run()`
+does, then compares its logit to the device's own logit buffer-by-buffer. A first run showed a
+large, weakly-correlated mismatch (mean `|diff|` 0.474, correlation 0.317) - flat across the
+recording (trend correlation 0.02, thirds ~0.45/0.51/0.46 each), ruling out an accumulating
+LSTM-state bug and pointing at a systematic, per-buffer computation difference instead. Six real,
+independent bugs were found and fixed chasing this down, in the order below; the last (LSTM
+`effective_bias`) accounted for most of the remaining gap.
+
+### Buffer-restarting STFT and raw int16 scale
+
+`student_model.py`'s `LogSpectrogram` computed one continuous STFT over a whole training clip;
+the firmware restarts frame/hop counting every 1024-sample buffer and never computes a frame
+spanning two buffers (confirmed earlier, see "Data capture" above). Restructured
+`LogSpectrogram.forward()` to do the same: reshape the waveform into buffers, run
+`frames_per_buffer` short-time FFTs per buffer independently, concatenate. Also found training
+loaded audio via `soundfile.read(dtype="float32")`, which normalizes samples to `[-1, 1]`, while
+the firmware's STFT runs directly on raw ADC `int16` values - a constant ~90.3dB
+(`20*log10(32768)`) scale mismatch on every log-magnitude value. Fixed by switching the deployed
+training/calibration/inference pipeline to `sf.read(path, dtype="int16")` throughout.
+
+Validated the restructured `LogSpectrogram` against a real device capture (audio + firmware-
+computed spectrogram from the same recording): max diff 0.19dB, concentrated almost entirely in
+the Nyquist bin (bin 128: mean 0.000726dB vs 0.000025dB for every other bin) - consistent with
+CMSIS-DSP's `arm_rfft_fast_f32` and `torch.fft.rfft` computing that one bin very slightly
+differently, not a bug in either implementation (the fixed-point log10 approximation itself is
+deterministic bit manipulation and contributes exactly 0 given identical input).
+
+### Streaming (causal) RMS normalization
+
+The firmware had no RMS normalization at all; training normalized each whole clip by its own
+RMS (a non-causal, whole-clip statistic the firmware cannot compute in real time from a stream of
+64ms buffers). Added `dataset.py`'s `streaming_rms_normalize()`: a per-buffer EMA of mean-square
+power (`RMS_EMA_ALPHA = 2/(RMS_EMA_BUFFERS+1)`, `RMS_EMA_BUFFERS ≈ 46.9` buffers ≈ 3s time
+constant), gain `= target_rms_raw / sqrt(running_mean_sq + eps)` applied to the waveform before
+`LogSpectrogram` - matched on-device by `main.c`'s `computeBufferGain()`/
+`resetRMSNormalization()`, gain folded directly into the existing windowing multiply
+(`stftFrame[i] = source[offset+i] * stftWindow[i] * bufferGain`).
+
+Training seeds each clip's EMA with a randomized `initial_rms = clip_rms * jitter` so the model
+sees plausible mid-stream RMS states, not just clips starting from silence. This `jitter` was
+first drawn from `torch.randn(1)` on the *global* RNG state - meaning `export_int8.py`'s
+`calibrate()` (which reuses the same dataset class to pick calibration clips) produced different
+per-channel quantization scales on every separate process invocation, silently breaking
+reproducibility between the export that generated the on-device C arrays and any later
+re-verification. Fixed by seeding an idx-local `torch.Generator().manual_seed(idx)` for the
+jitter draw; confirmed fixed via a double-call test showing identical `input`/`stage1_dw`/`cell`
+scales across repeated invocations.
+
+### Missing 150Hz high-pass filter on-device
+
+`LogSpectrogram` masks the lowest bins (below ~150Hz) to zero before feeding the model; the
+firmware's STFT never did this. Added `STFT_HIGHPASS_BIN = 3` masking to all three
+`STFT_LOG_MODE` branches (`LOG10F`/`VLOG`/`LOG10_FIXED`) in `main.c`, matching
+`LogSpectrogram`'s mask exactly.
+
+### `runAvgPoolFreq()`: NCHW vs NHWC indexing bug
+
+CMSIS-NN's conv/depthwise kernels produce and consume NHWC (channel-innermost) tensors,
+confirmed by reading `cmsis_nn_dims={n,h,w,c}` and the kernel source's own indexing -
+`model_inference.c`'s hand-written frequency-only average pool (`runAvgPoolFreq()`, needed
+because no CMSIS-NN kernel pools one spatial axis only) indexed it as NCHW
+(`input[(c*h+y)*w+x]`) instead. Fixed to `input[(y*w+x)*channels+c]`. Confirmed via a native
+numeric test against `int8_sim.py`'s reference: max error 29/127 before the fix, 0 after.
+
+### Depthwise conv weight export layout bug
+
+CMSIS-NN's depthwise kernels expect weights as `[1, kH, kW, channels]` (kernel-position-major,
+channel-minor); PyTorch's native depthwise weight layout is `[Cout, 1, kH, kW]`
+(channel-major). `export_int8.py`'s `export_c()` wrote the raw PyTorch layout straight to the C
+arrays. Fixed by detecting depthwise layers (`is_depthwise = groups == in_ch == out_ch`) and
+permuting via `np.transpose(layer.weight[:, 0, :, :], (1, 2, 0))` before export. Confirmed via a
+native test: 367/648 weight-affected outputs wrong before the fix, 0/648 after.
+
+### The major bug: LSTM `effective_bias` NULL pointer
+
+Even after all five fixes above, a temporary on-device verification check (comparing the real
+`arm_nn_lstm_step_s8()` kernel's output against an `int8_sim.py`-equivalent hand reference,
+exposed via extra CSV/binary columns, same pattern used earlier for the pointwise-conv
+optimization check) showed a massive 22.66/32 mean mismatch per buffer, out of 305 buffers - the
+LSTM step itself was wrong on real hardware, not just a downstream scale/layout issue.
+
+Root cause, confirmed by reading `arm_nn_lstm_calculate_gate_s8_s16()`'s source directly (called
+internally by `arm_nn_lstm_step_s8()`): it never reads `cmsis_nn_lstm_gate.bias` at all - only
+`input_effective_bias` and `hidden_effective_bias`. `model_inference.c`'s `runLSTMStep()` set
+both of those to `NULL` for all four gates (forget/input/cell/output), wiring only the unused
+`bias` field. Because address 0 happens to be mapped to the Cortex-M vector table in flash (not
+an unmapped, faulting region on this core), every gate's "bias" silently read vector-table bytes
+instead of crashing - a quiet wrong-answer bug, not a hard fault, which is why it survived
+undetected through every earlier build/flash/run cycle.
+
+Fix, cross-checked against CMSIS-NN's own test generator (`Tests/UnitTest/lstm_settings.py`'s
+`calc_effective_bias()`) to get the convention exactly right:
+- `input_effective_bias = round(bias_float / (input_scale * weight_scale))` - the bias in the
+  same pre-requantization accumulator domain as the input-side matmul (zero_point is 0 here, so
+  no `row_sum(weights)*zero_point` term), the standard TFLite/CMSIS-NN bias quantization
+  convention.
+- `hidden_effective_bias = 0` for all gates (a zero array, `lstmZeroEffectiveBias[16]`) - the
+  bias must be added exactly once, and it's already folded into the input-side pass.
+
+Implemented in `export_int8.py`'s `_quantize_gate()` (computes and exports
+`input_effective_bias` per gate as a new C array) and `model_inference.c`'s `runLSTMStep()`
+(wires `input_effective_bias`/`hidden_effective_bias` instead of `NULL`; the old `bias_q3_12`
+assignments were left in place, confirmed harmless/unused by the real kernel).
+
+Validated in two stages before trusting it: first a native x86 test against the real
+`arm_nn_lstm_step_s8()` kernel (not just a hand reference mirroring `int8_sim.py`'s math, which
+had given an ambiguous first result) confirmed hidden state matched exactly and cell state was
+off by only 1-2 units per element - consistent with the known sigmoid/tanh float-vs-LUT
+approximation gap, not a remaining bug. Then on real hardware:
+
+| | Before fix | After fix |
+|---|---|---|
+| LSTM step mismatches (out of 32 = 16 hidden + 16 cell) | 22.66/32 mean, 0/305 buffers exact | 7.38/32 mean, 0/294 buffers exact (residual = known LUT-vs-float noise) |
+| Device vs PC logit mean `\|diff\|` | 0.474 | 0.0012 |
+| Device vs PC logit correlation | 0.317 | 0.9999 |
+
+The temporary verification scaffolding (`verifyLSTMStep()` and friends in `model_inference.c`,
+the `lstmMismatches` timing field, the corresponding CSV/binary column) was removed once the fix
+was confirmed; the permanent fix (`input_effective_bias`/`hidden_effective_bias` wiring,
+`export_int8.py`'s `_quantize_gate()` change) stayed.
+
+**Takeaway**: five independent, real bugs (STFT framing, scale, RMS normalization, high-pass
+filter, avgpool indexing, weight export layout) each moved the numbers, but none of them alone
+explained a mismatch this large and this flat across the recording - only reading the actual
+CMSIS-NN kernel source (rather than trusting the struct field names `bias` vs `*_effective_bias`
+to mean what they suggest) found the dominant cause. As elsewhere in this investigation, the
+fix that mattered most came from checking against the library's own source and test generator,
+not from guessing based on plausible-looking field names.
+
+### Performance re-check after all six correctness fixes
+
+All six fixes above change what gets computed (or which pointers a kernel reads), not how much
+work is done, so a re-run of the same `STFT_OUTPUT_MODE_CSV` per-stage timing test (186 buffers,
+real hardware) was expected to land close to the pre-fix numbers:
+
+| | Before fixes | After fixes | Δ |
+|---|---|---|---|
+| STFT | 4486 µs | 4718 µs | +232 µs (+5.2%) |
+| Inference | 32868 µs | 32688 µs | -180 µs (-0.6%) |
+| **Total** | **37354 µs** | **37406 µs** | **+52 µs, still 58.4%** |
+
+The small STFT increase is exactly accounted for by the two real additions to that stage: the
+per-buffer RMS gain computation and the high-pass bin masking, neither of which existed at the
+earlier measurement. Inference time is unchanged within timer-quantization noise (the LSTM
+`effective_bias` fix only changes which pointers `arm_nn_lstm_step_s8()` reads, not how much
+arithmetic it does), confirming the correctness fixes cost nothing in the real-time budget -
+margin stays at ~41.6% of the 64ms buffer.
 
 ## Operational notes from this debug branch
 

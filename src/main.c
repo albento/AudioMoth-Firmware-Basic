@@ -2794,6 +2794,41 @@ inline void AudioMoth_handleSwitchInterrupt() {
 
 #define STFT_LOG_EPSILON                          1.0e-6f
 
+/* Matches student_model.py's LogSpectrogram exactly: bins below 150Hz are zeroed (not just
+   attenuated) before the log, a brick-wall cut to discard wind/handling rumble and DC offset
+   that would otherwise show up as high log-magnitude energy the model was never trained to
+   see there. bin_width = STFT_SAMPLE_RATE / STFT_FFT_LENGTH = 62.5Hz; highpass_bin =
+   ceil(150 / 62.5) = 3, so bins 0/1/2 (0Hz/62.5Hz/125Hz) are masked, matching
+   math.ceil(150.0 / bin_width) there bit for bit - only valid for this exact sample
+   rate/FFT length pair, not recomputed generically. */
+
+#define STFT_HIGHPASS_BIN                         3
+
+/* Streaming RMS normalization, matching dataset.streaming_rms_normalize() exactly (see
+   test-audiomoth-cnn/dataset.py/CLAUDE notes) - training's old rms_normalize() needed the
+   RMS of the entire 3-second clip before it could normalize a single sample, something a
+   real-time device can never do (it would have to know the future). This is the causal
+   equivalent: an exponential moving average of each buffer's own mean-square power, updated
+   once per buffer, turned into a linear gain applied to that buffer's samples before
+   windowing/FFT (folded directly into the existing per-sample window multiply below, never
+   mutating the raw DMA buffer itself). Persists for the whole recording - reset only once,
+   at the same point ModelInference_reset() resets the LSTM state (see
+   resetRMSNormalization()/runSTFTFeasibilityTest()), never mid-recording.
+
+   STFT_INT16_FULL_SCALE: the firmware's own raw ADC samples are never divided by 32768 (see
+   the STFT_LOG_MODE branches below - source[...] is cast straight to float), so this works
+   in that same raw scale, not a [-1,1]-normalized one.
+   STFT_RMS_EMA_BUFFERS: 2/(N+1) is the standard convention for "this exponential average
+   behaves like a simple moving average of N samples" - N chosen to match CLIP_SECONDS=3.0s
+   (MAXIMUM_SAMPLES_IN_DMA_TRANSFER=1024 samples per buffer @ 16kHz = 64ms/buffer,
+   3.0s/0.064s = 46.875 buffers) - not empirically tuned, must stay equal to dataset.py's
+   RMS_EMA_BUFFERS if that ever changes. */
+
+#define STFT_TARGET_RMS                           0.1f
+#define STFT_INT16_FULL_SCALE                     32768.0f
+#define STFT_RMS_EMA_BUFFERS                      46.875f
+#define STFT_RMS_EMA_ALPHA                        (2.0f / (STFT_RMS_EMA_BUFFERS + 1.0f))
+
 #define STFT_TWO_PI                               6.28318530717958647692f
 
 /* Selects how the spectrogram magnitude is scaled, to compare their STFT timing cost against each other */
@@ -2892,6 +2927,7 @@ typedef struct {
     uint32_t elapsedMicroseconds;
     int16_t audio[MAXIMUM_SAMPLES_IN_DMA_TRANSFER];
     float32_t spectrogram[STFT_NUMBER_OF_FRAMES][STFT_NUMBER_OF_BINS];
+    float32_t modelLogit;
 } stftRecord_t;
 
 #else
@@ -2943,6 +2979,49 @@ static volatile uint32_t stftRecordQueueReadIndex;
 
 static volatile uint32_t stftBufferCounter;
 
+/* Persistent streaming RMS estimate (mean-square power, raw ADC scale) - see
+   STFT_RMS_EMA_ALPHA's comment above. Reset once per recording (resetRMSNormalization(),
+   called from runSTFTFeasibilityTest() alongside ModelInference_reset()), then updated once
+   per buffer by computeBufferGain() below - never reset mid-recording. */
+
+static float stftRunningMeanSq;
+
+static void resetRMSNormalization(void) {
+
+    float targetRmsRaw = STFT_TARGET_RMS * STFT_INT16_FULL_SCALE;
+
+    stftRunningMeanSq = targetRmsRaw * targetRmsRaw;
+
+}
+
+/* Updates the running mean-square estimate with this buffer's own power and returns the
+   linear gain to apply to its samples - matches dataset.streaming_rms_normalize()'s
+   per-buffer loop body exactly (mean-square accumulate, EMA update, gain = target/sqrt(...)).
+   +1.0f in the sqrt matches that function's eps=1.0 (avoids dividing by zero during true
+   digital silence, negligible next to any real signal at this raw int16 scale). */
+
+static float computeBufferGain(const int16_t *source) {
+
+    float targetRmsRaw = STFT_TARGET_RMS * STFT_INT16_FULL_SCALE;
+
+    float sum = 0.0f;
+
+    for (uint32_t i = 0; i < MAXIMUM_SAMPLES_IN_DMA_TRANSFER; i += 1) {
+
+        float sample = (float32_t)source[i];
+
+        sum += sample * sample;
+
+    }
+
+    float bufferMeanSq = sum / (float)MAXIMUM_SAMPLES_IN_DMA_TRANSFER;
+
+    stftRunningMeanSq = STFT_RMS_EMA_ALPHA * bufferMeanSq + (1.0f - STFT_RMS_EMA_ALPHA) * stftRunningMeanSq;
+
+    return targetRmsRaw / sqrtf(stftRunningMeanSq + 1.0f);
+
+}
+
 /* Replaces the normal recording ISR: instead of filtering the buffer into the SD card recording pipeline, compute its STFT and time how long that takes */
 
 inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, int16_t **nextBuffer) {
@@ -2953,13 +3032,15 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     AudioMoth_getTimeMicroseconds(&startTime, &startMicroseconds);
 
+    float bufferGain = computeBufferGain(source);
+
     for (uint32_t frame = 0; frame < STFT_NUMBER_OF_FRAMES; frame += 1) {
 
         uint32_t offset = frame * STFT_HOP_LENGTH;
 
         for (uint32_t i = 0; i < STFT_FFT_LENGTH; i += 1) {
 
-            stftFrame[i] = (float32_t)source[offset + i] * stftWindow[i];
+            stftFrame[i] = (float32_t)source[offset + i] * stftWindow[i] * bufferGain;
 
         }
 
@@ -2969,7 +3050,9 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
 #if STFT_LOG_MODE == STFT_LOG_MODE_LOG10F
 
-        stftSpectrogramDb[frame][0] = 20.0f * log10f(fabsf(stftFFTOutput[0]) + STFT_LOG_EPSILON);
+        /* Bin 0 (DC, 0Hz) is always below STFT_HIGHPASS_BIN - masked to the epsilon floor, matching student_model.py's LogSpectrogram exactly (magnitude zeroed before the log, not the log output clamped after) */
+
+        stftSpectrogramDb[frame][0] = 20.0f * log10f(STFT_LOG_EPSILON);
 
         stftSpectrogramDb[frame][STFT_FFT_LENGTH / 2] = 20.0f * log10f(fabsf(stftFFTOutput[1]) + STFT_LOG_EPSILON);
 
@@ -2979,13 +3062,15 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
             float32_t im = stftFFTOutput[2 * bin + 1];
 
-            stftSpectrogramDb[frame][bin] = 20.0f * log10f(sqrtf(re * re + im * im) + STFT_LOG_EPSILON);
+            float32_t magnitude = (bin < STFT_HIGHPASS_BIN) ? 0.0f : sqrtf(re * re + im * im);
+
+            stftSpectrogramDb[frame][bin] = 20.0f * log10f(magnitude + STFT_LOG_EPSILON);
 
         }
 
 #elif STFT_LOG_MODE == STFT_LOG_MODE_VLOG
 
-        stftMagnitude[0] = fabsf(stftFFTOutput[0]) + STFT_LOG_EPSILON;
+        stftMagnitude[0] = STFT_LOG_EPSILON;
 
         stftMagnitude[STFT_FFT_LENGTH / 2] = fabsf(stftFFTOutput[1]) + STFT_LOG_EPSILON;
 
@@ -2995,7 +3080,9 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
             float32_t im = stftFFTOutput[2 * bin + 1];
 
-            stftMagnitude[bin] = sqrtf(re * re + im * im) + STFT_LOG_EPSILON;
+            float32_t magnitude = (bin < STFT_HIGHPASS_BIN) ? 0.0f : sqrtf(re * re + im * im);
+
+            stftMagnitude[bin] = magnitude + STFT_LOG_EPSILON;
 
         }
 
@@ -3011,7 +3098,7 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
 #elif STFT_LOG_MODE == STFT_LOG_MODE_LOG10_FIXED
 
-        stftSpectrogramDb[frame][0] = 20.0f * stftFastLog10(fabsf(stftFFTOutput[0]) + STFT_LOG_EPSILON);
+        stftSpectrogramDb[frame][0] = 20.0f * stftFastLog10(STFT_LOG_EPSILON);
 
         stftSpectrogramDb[frame][STFT_FFT_LENGTH / 2] = 20.0f * stftFastLog10(fabsf(stftFFTOutput[1]) + STFT_LOG_EPSILON);
 
@@ -3021,7 +3108,9 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
             float32_t im = stftFFTOutput[2 * bin + 1];
 
-            stftSpectrogramDb[frame][bin] = 20.0f * stftFastLog10(sqrtf(re * re + im * im) + STFT_LOG_EPSILON);
+            float32_t magnitude = (bin < STFT_HIGHPASS_BIN) ? 0.0f : sqrtf(re * re + im * im);
+
+            stftSpectrogramDb[frame][bin] = 20.0f * stftFastLog10(magnitude + STFT_LOG_EPSILON);
 
         }
 
@@ -3051,9 +3140,7 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     uint32_t elapsedMicroseconds = (endTime - startTime) * MICROSECONDS_IN_SECOND + endMicroseconds - startMicroseconds;
 
-#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_CSV
-
-    /* Runs the exported classifier on the buffer just computed, timed separately from the STFT above so elapsedMicroseconds stays comparable with every earlier STFT-only measurement. Still in the ISR, like the STFT itself - the point of this test is exactly whether inference also fits in the 64ms budget, which only a real ISR-context measurement answers. The logit isn't used for anything yet - this is a timing test only. */
+    /* Runs the exported classifier on the buffer just computed, timed separately from the STFT above so elapsedMicroseconds stays comparable with every earlier STFT-only measurement. Still in the ISR, like the STFT itself. Runs in both output modes now: CSV keeps the per-stage timing, BINARY keeps the logit so it can be captured alongside the spectrogram that produced it and replayed through int8_sim.py on a PC to check the on-device CMSIS-NN execution against a bit-exact Python reference of the same int8 arithmetic. */
 
     uint32_t inferenceStartTime, inferenceStartMicroseconds;
 
@@ -3063,15 +3150,11 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     float modelLogit = ModelInference_run(stftSpectrogramDb, &modelTiming);
 
-    (void)modelLogit;
-
     uint32_t inferenceEndTime, inferenceEndMicroseconds;
 
     AudioMoth_getTimeMicroseconds(&inferenceEndTime, &inferenceEndMicroseconds);
 
     uint32_t inferenceMicroseconds = (inferenceEndTime - inferenceStartTime) * MICROSECONDS_IN_SECOND + inferenceEndMicroseconds - inferenceStartMicroseconds;
-
-#endif
 
     /* In binary mode, the raw audio and the spectrogram just computed are also copied into the next free record. That copy (a few KB to external SRAM) happens after elapsedMicroseconds is captured, so that value still reflects only the STFT computation, comparable with earlier measurements. */
 
@@ -3088,6 +3171,8 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
         memcpy(stftRecordQueue[stftRecordQueueWriteIndex].audio, source, sizeof(stftRecordQueue[0].audio));
 
         memcpy(stftRecordQueue[stftRecordQueueWriteIndex].spectrogram, stftSpectrogramDb, sizeof(stftRecordQueue[0].spectrogram));
+
+        stftRecordQueue[stftRecordQueueWriteIndex].modelLogit = modelLogit;
 
 #else
 
@@ -3117,7 +3202,21 @@ static void runSTFTFeasibilityTest(void) {
 
     }
 
-    arm_rfft_fast_init_f32(&stftFFTInstance, STFT_FFT_LENGTH);
+    /* arm_rfft_fast_init_f32() is a generic dispatcher with a switch-case over every
+       supported FFT length (16 to 4096) - since STFT_FFT_LENGTH is a compile-time constant
+       here but the dispatcher takes a runtime argument, the compiler can't prove which case
+       executes, so gc-sections can't strip the other sizes' twiddle/bit-reversal tables:
+       confirmed via the linker map, ~69KB of otherwise-unreachable flash for sizes 512-4096
+       (see EXPERIMENTS.md). Calling the 256-specific init directly removes that ambiguity -
+       only the 256-point tables are referenced, everything else gets linked out. Tied to
+       STFT_FFT_LENGTH==256 specifically - the #error below catches anyone changing that
+       define without updating this call to match. */
+
+#if STFT_FFT_LENGTH != 256
+#error "arm_rfft_fast_init_256_f32() below is hard-coded for STFT_FFT_LENGTH==256 - use arm_rfft_fast_init_f32(&stftFFTInstance, STFT_FFT_LENGTH) instead if this changes (costs ~69KB of unused twiddle tables for the other sizes, see EXPERIMENTS.md)"
+#endif
+
+    arm_rfft_fast_init_256_f32(&stftFFTInstance);
 
     /* Wait for the SD card to be present and the log file to open successfully before doing anything else. Without this, a missing/removed SD card leaves the device in an undefined state that is indistinguishable from a hang and only recoverable by re-flashing. The red LED blinks once a second while waiting, and inserting the card lets it recover on its own. */
 
@@ -3189,6 +3288,8 @@ static void runSTFTFeasibilityTest(void) {
     stftRecordQueueReadIndex = 0;
 
     ModelInference_reset();
+
+    resetRMSNormalization();
 
     AudioMoth_startMicrophoneSamples(STFT_SAMPLE_RATE);
 

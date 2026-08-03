@@ -35,6 +35,7 @@ def load(path):
             ("elapsed_us", "<u4"),
             ("audio", "<i2", (int(header["audio_length"]),)),
             ("spectrogram", "<f4", (int(header["number_of_frames"]), int(header["number_of_bins"]))),
+            ("model_logit", "<f4"),
         ])
 
         records = np.fromfile(f, dtype=record_dtype)

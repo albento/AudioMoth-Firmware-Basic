@@ -37,12 +37,20 @@
 /* Largest single-stage activation tensor is stage0's output: 16 * 65 * 4 = 4160 bytes -
    too big for the internal RAM already committed elsewhere (see EXPERIMENTS.md), so both
    ping-pong activation buffers live in external SRAM, which is otherwise idle in
-   STFT_OUTPUT_MODE_CSV (the same reasoning as stftRecordQueue in main.c). */
+   STFT_OUTPUT_MODE_CSV (the same reasoning as stftRecordQueue in main.c).
+
+   In STFT_OUTPUT_MODE_BINARY, main.c's stftRecordQueue ALSO lives in external SRAM,
+   starting at the same AM_EXTERNAL_SRAM_START_ADDRESS - 8 records of (4+4+1024*2+7*129*4+4)
+   = 5672 bytes each = 45376 bytes. These buffers are placed at a 64KB offset, safely past
+   that, so the two never overlap regardless of which STFT_OUTPUT_MODE is active. Not
+   computed from main.c's own definitions (STFT_RECORD_QUEUE_LENGTH/stftRecord_t aren't
+   visible here) - if that queue's size ever grows past 64KB this offset must move too. */
 
 #define ACTIVATION_BUFFER_SIZE   4160
+#define ACTIVATION_BUFFER_BASE_OFFSET   65536
 
-static int8_t *activationBufferA = (int8_t*)(AM_EXTERNAL_SRAM_START_ADDRESS);
-static int8_t *activationBufferB = (int8_t*)(AM_EXTERNAL_SRAM_START_ADDRESS + ACTIVATION_BUFFER_SIZE);
+static int8_t *activationBufferA = (int8_t*)(AM_EXTERNAL_SRAM_START_ADDRESS + ACTIVATION_BUFFER_BASE_OFFSET);
+static int8_t *activationBufferB = (int8_t*)(AM_EXTERNAL_SRAM_START_ADDRESS + ACTIVATION_BUFFER_BASE_OFFSET + ACTIVATION_BUFFER_SIZE);
 
 /* Input tensor (quantized, transposed spectrogram) and the LSTM's tiny input vector both
    fit easily in internal RAM. */
@@ -51,10 +59,10 @@ static int8_t inputBuffer[MODEL_INFERENCE_INPUT_BINS * MODEL_INFERENCE_INPUT_FRA
 
 static int8_t pooledBuffer[MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_SIZE];
 
-/* Scratch buffer for runDepthwiseConv()'s arm_depthwise_conv_s8_opt call - the only
-   remaining user now that stage0/stage1_pw/stage2_pw are hand-written and no longer call
-   arm_convolve_s8 (see runStage0Conv()/runPointwiseConv() below). Sized for the largest of
-   the two depthwise stages: Cin * kH * kW * sizeof(int16_t) (confirmed from
+/* Scratch buffer shared by runConv()'s arm_convolve_s8 calls (stage1_pw/stage2_pw) and
+   runDepthwiseConv()'s arm_depthwise_conv_s8_opt call (stage1_dw/stage2_dw) - stage0 is
+   hand-written (runStage0Conv()) and needs no scratch buffer at all. Sized for the larger
+   requirement: Cin * kH * kW * sizeof(int16_t) (confirmed from
    arm_depthwise_conv_s8_opt_get_buffer_size_dsp()), 32*3*3*2 = 576 bytes for stage2_dw. */
 
 static int16_t convScratchBuffer[288];
@@ -67,6 +75,21 @@ static int16_t convScratchBuffer[288];
 static int16_t lstmTemp1[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE];
 static int16_t lstmTemp2[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE];
 static int16_t lstmCellState[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE];
+
+/* arm_nn_lstm_calculate_gate_s8_s16() (the function arm_nn_lstm_step_s8() actually calls
+   per gate) never reads cmsis_nn_lstm_gate's own `bias` field at all - only
+   input_effective_bias/hidden_effective_bias, added to the raw accumulator BEFORE each
+   requantization step (confirmed directly from its source, and from CMSIS-NN's own
+   lstm_settings.py test generator's calc_effective_bias()). Leaving these NULL (as this
+   file did until now) makes the kernel dereference a null pointer - which doesn't fault on
+   this core, since address 0 is mapped to the start of flash (the vector table), so it
+   silently reads whatever bytes live there as "bias" instead - a real, confirmed-on-hardware
+   bug, not a hypothetical one. The real bias (same value as bias_q3_12, just in the raw
+   accumulator's pre-multiply-shift domain - see export_int8.py's _quantize_gate) belongs in
+   input_effective_bias; hidden_effective_bias is always zero (the bias is added exactly
+   once, during the input-weights pass only) - this array is shared by all four gates. */
+
+static const int32_t lstmZeroEffectiveBias[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE] = {0};
 static int8_t lstmHiddenState[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE];
 
 void ModelInference_reset(void) {
@@ -245,7 +268,18 @@ static void runDepthwiseConv(const int8_t *input, int8_t *output, const int8_t *
    CMSIS-NN kernel does this exact shape (arm_avgpool_s8 pools both axes), so this is a
    plain int32 accumulate-and-round-divide, matching int8_sim.py's avgpool_freq_s8()
    exactly. With this model's fixed input size, W is always 1 by this point (see the
-   STAGE2_PW_OUT_W define above), so this reduces to one scalar average per channel. */
+   STAGE2_PW_OUT_W define above), so this reduces to one scalar average per channel.
+
+   input is HWC (CMSIS-NN's actual output layout - position-major, channel-minor: index =
+   (y*w+x)*channels+c, confirmed directly from arm_convolve_s8.c/arm_nn_mat_mult_kernel_s8_s16.c/
+   arm_depthwise_conv_s8_opt.c's own write patterns, all of which write every channel for one
+   position before moving to the next - and from cmsis_nn_dims itself, {n,h,w,c}, c last).
+   This function used to read it as CHW (channel-planar: (c*h+y)*w+x) instead - silently wrong
+   for any channels>1, confirmed by a direct numeric check against int8_sim.py's
+   avgpool_freq_s8 (max error 29 on a 0-127 scale) - not something a compile or a shape check
+   would ever catch, since both formulas produce valid in-bounds indices. output stays a
+   plain per-channel list (w=1 by the time this runs, so channel order is unambiguous either
+   way). */
 
 static void runAvgPoolFreq(const int8_t *input, int8_t *output, int32_t channels, int32_t h, int32_t w) {
 
@@ -257,7 +291,7 @@ static void runAvgPoolFreq(const int8_t *input, int8_t *output, int32_t channels
 
             int32_t sum = 0;
 
-            for (y = 0; y < h; y += 1) sum += input[(c * h + y) * w + x];
+            for (y = 0; y < h; y += 1) sum += input[(y * w + x) * channels + c];
 
             output[c * w + x] = (int8_t)((sum >= 0 ? sum + h / 2 : sum - h / 2) / h);
 
@@ -316,44 +350,44 @@ static void runLSTMStep(void) {
     params.forget_gate.input_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_GATE_INPUT_MULTIPLIER;
     params.forget_gate.input_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_GATE_INPUT_SHIFT;
     params.forget_gate.input_weights = model_int8_lstm_small_16_focal_forget_gate_input_weight;
-    params.forget_gate.input_effective_bias = NULL;
+    params.forget_gate.input_effective_bias = model_int8_lstm_small_16_focal_forget_gate_input_effective_bias;
     params.forget_gate.hidden_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_GATE_HIDDEN_MULTIPLIER;
     params.forget_gate.hidden_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_GATE_HIDDEN_SHIFT;
     params.forget_gate.hidden_weights = model_int8_lstm_small_16_focal_forget_gate_hidden_weight;
-    params.forget_gate.hidden_effective_bias = NULL;
+    params.forget_gate.hidden_effective_bias = lstmZeroEffectiveBias;
     params.forget_gate.bias = model_int8_lstm_small_16_focal_forget_gate_bias_q3_12;
     params.forget_gate.activation_type = ARM_SIGMOID;
 
     params.input_gate.input_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_GATE_INPUT_MULTIPLIER;
     params.input_gate.input_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_GATE_INPUT_SHIFT;
     params.input_gate.input_weights = model_int8_lstm_small_16_focal_input_gate_input_weight;
-    params.input_gate.input_effective_bias = NULL;
+    params.input_gate.input_effective_bias = model_int8_lstm_small_16_focal_input_gate_input_effective_bias;
     params.input_gate.hidden_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_GATE_HIDDEN_MULTIPLIER;
     params.input_gate.hidden_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_GATE_HIDDEN_SHIFT;
     params.input_gate.hidden_weights = model_int8_lstm_small_16_focal_input_gate_hidden_weight;
-    params.input_gate.hidden_effective_bias = NULL;
+    params.input_gate.hidden_effective_bias = lstmZeroEffectiveBias;
     params.input_gate.bias = model_int8_lstm_small_16_focal_input_gate_bias_q3_12;
     params.input_gate.activation_type = ARM_SIGMOID;
 
     params.cell_gate.input_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_CELL_GATE_INPUT_MULTIPLIER;
     params.cell_gate.input_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_CELL_GATE_INPUT_SHIFT;
     params.cell_gate.input_weights = model_int8_lstm_small_16_focal_cell_gate_input_weight;
-    params.cell_gate.input_effective_bias = NULL;
+    params.cell_gate.input_effective_bias = model_int8_lstm_small_16_focal_cell_gate_input_effective_bias;
     params.cell_gate.hidden_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_CELL_GATE_HIDDEN_MULTIPLIER;
     params.cell_gate.hidden_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_CELL_GATE_HIDDEN_SHIFT;
     params.cell_gate.hidden_weights = model_int8_lstm_small_16_focal_cell_gate_hidden_weight;
-    params.cell_gate.hidden_effective_bias = NULL;
+    params.cell_gate.hidden_effective_bias = lstmZeroEffectiveBias;
     params.cell_gate.bias = model_int8_lstm_small_16_focal_cell_gate_bias_q3_12;
     params.cell_gate.activation_type = ARM_TANH;
 
     params.output_gate.input_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_GATE_INPUT_MULTIPLIER;
     params.output_gate.input_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_GATE_INPUT_SHIFT;
     params.output_gate.input_weights = model_int8_lstm_small_16_focal_output_gate_input_weight;
-    params.output_gate.input_effective_bias = NULL;
+    params.output_gate.input_effective_bias = model_int8_lstm_small_16_focal_output_gate_input_effective_bias;
     params.output_gate.hidden_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_GATE_HIDDEN_MULTIPLIER;
     params.output_gate.hidden_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_GATE_HIDDEN_SHIFT;
     params.output_gate.hidden_weights = model_int8_lstm_small_16_focal_output_gate_hidden_weight;
-    params.output_gate.hidden_effective_bias = NULL;
+    params.output_gate.hidden_effective_bias = lstmZeroEffectiveBias;
     params.output_gate.bias = model_int8_lstm_small_16_focal_output_gate_bias_q3_12;
     params.output_gate.activation_type = ARM_SIGMOID;
 
