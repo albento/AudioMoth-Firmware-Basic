@@ -39,15 +39,22 @@
    ping-pong activation buffers live in external SRAM, which is otherwise idle in
    STFT_OUTPUT_MODE_CSV (the same reasoning as stftRecordQueue in main.c).
 
-   In STFT_OUTPUT_MODE_BINARY, main.c's stftRecordQueue ALSO lives in external SRAM,
-   starting at the same AM_EXTERNAL_SRAM_START_ADDRESS - 8 records of (4+4+1024*2+7*129*4+4)
-   = 5672 bytes each = 45376 bytes. These buffers are placed at a 64KB offset, safely past
-   that, so the two never overlap regardless of which STFT_OUTPUT_MODE is active. Not
-   computed from main.c's own definitions (STFT_RECORD_QUEUE_LENGTH/stftRecord_t aren't
-   visible here) - if that queue's size ever grows past 64KB this offset must move too. */
+   Three mutually-exclusive top-level modes share this 256KB of external SRAM, never
+   concurrently (STFT_DEBUG_MODE / TRIGGERED_RECORDING_MODE / normal recording are all
+   `#if`-selected at compile time in main.c, only one is ever linked into a given build) -
+   this offset only needs to sit past whichever one of those is active in a given build:
+
+   - STFT_OUTPUT_MODE_BINARY: main.c's stftRecordQueue lives at the start of external SRAM
+     - 8 records of (4+4+1024*2+7*129*4+4) = 5672 bytes each = 45376 bytes.
+   - TRIGGERED_RECORDING_MODE: main.c's prerollRing (12 * 2048 = 24576 bytes) followed by
+     triggerQueue (32 records of ~2056 bytes = 65792 bytes) occupy bytes [0, 90368) of
+     external SRAM - this is the largest of the three, so it sets the offset below.
+
+   Not computed from main.c's own definitions (none of these structures are visible here) -
+   if any of them ever grow past this offset, it must move too. */
 
 #define ACTIVATION_BUFFER_SIZE   4160
-#define ACTIVATION_BUFFER_BASE_OFFSET   65536
+#define ACTIVATION_BUFFER_BASE_OFFSET   90368
 
 static int8_t *activationBufferA = (int8_t*)(AM_EXTERNAL_SRAM_START_ADDRESS + ACTIVATION_BUFFER_BASE_OFFSET);
 static int8_t *activationBufferB = (int8_t*)(AM_EXTERNAL_SRAM_START_ADDRESS + ACTIVATION_BUFFER_BASE_OFFSET + ACTIVATION_BUFFER_SIZE);

@@ -18,11 +18,26 @@
 #include "digitalfilter.h"
 #include "model_inference.h"
 
-/* STFT feasibility debug mode - set to 0 to restore normal recording firmware */
+/* STFT feasibility debug mode - set to 0 to restore normal recording firmware. Mutually
+   exclusive with TRIGGERED_RECORDING_MODE below - only one of the two may be 1 at a time
+   (see the #error guard just below). */
 
-#define STFT_DEBUG_MODE                          1
+#define STFT_DEBUG_MODE                          0
 
-#if STFT_DEBUG_MODE
+/* Continuously listens and runs the on-device INT8 classifier (model_inference.c) every
+   64ms buffer; whenever its output crosses TRIGGER_LOGIT_THRESHOLD, records a new WAV file
+   (with ~TRIGGER_PREROLL_SECONDS of pre-roll audio), keeping it open while re-triggered
+   (sliding TRIGGER_TAIL_SECONDS countdown) and closing it once the countdown lapses - see
+   runTriggeredRecording(). See GUIDE_REIMPLEMENTATION.md for the STFT/model pipeline this
+   reuses, and the plan this was built from for the full design rationale. */
+
+#define TRIGGERED_RECORDING_MODE                 1
+
+#if STFT_DEBUG_MODE && TRIGGERED_RECORDING_MODE
+#error "STFT_DEBUG_MODE and TRIGGERED_RECORDING_MODE are mutually exclusive - set at most one to 1"
+#endif
+
+#if STFT_DEBUG_MODE || TRIGGERED_RECORDING_MODE
 #include "arm_math.h"
 #endif
 
@@ -1498,6 +1513,17 @@ static AM_recordingState_t makeRecording(uint32_t timeOfNextRecording, uint32_t 
 static void runSTFTFeasibilityTest(void);
 #endif
 
+#if TRIGGERED_RECORDING_MODE
+static void runTriggeredRecording(void);
+#endif
+
+/* Forward-declared so TRIGGERED_RECORDING_MODE's openTriggeredWavFile() (defined well
+   before makeRecording() further down, where this is otherwise first defined) can call it -
+   pure/stateless (a timestamp + bool in, a folder/filename out), safe to call from a
+   wholly different code path. */
+
+static void generateFolderAndFilename(char *foldername, char *filename, uint32_t timestamp, bool triggeredRecording);
+
 static void scheduleRecording(uint32_t currentTime, uint32_t *timeOfNextRecording, uint32_t *indexOfNextRecording, uint32_t *durationOfNextRecording, uint32_t *startOfRecordingPeriod, uint32_t *endOfRecordingPeriod);
 
 static void determineTimeOfNextSunriseSunsetCalculation(uint32_t currentTime, uint32_t *timeOfNextSunriseSunsetCalculation);
@@ -1523,6 +1549,21 @@ static void copyToBackupDomain(uint32_t *dst, uint8_t *src, uint32_t length) {
     }
 
     if (length % UINT32_SIZE_IN_BYTES) *(dst + length / UINT32_SIZE_IN_BYTES) = value;
+
+}
+
+/* Seeds deploymentID with its all-zero default. Only ever meaningful to call once per cold
+   boot (inside an `if (AudioMoth_isInitialPowerUp())` guard) - factored out so both the
+   normal power-up path below AND runTriggeredRecording() (which, on a genuine cold boot
+   straight into that mode, never reaches the normal power-up block at all - see main())
+   can seed it, each behind their own single AudioMoth_isInitialPowerUp() check, without
+   calling that function twice in the same run. Without this, generateFolderAndFilename()
+   would embed electrically-arbitrary backup-RAM content in every triggered filename
+   whenever enableFilenameWithDeviceID is set. */
+
+static void initialiseDeploymentID(void) {
+
+    copyToBackupDomain((uint32_t*)deploymentID, (uint8_t*)defaultDeploymentID, DEPLOYMENT_ID_LENGTH);
 
 }
 
@@ -1710,6 +1751,18 @@ int main(void) {
 
 #endif
 
+#if TRIGGERED_RECORDING_MODE
+
+    /* Same bypass pattern as STFT_DEBUG_MODE above - only when the switch is not in the USB position, so the device can always be reflashed via the switch. runTriggeredRecording() never returns while the switch stays in the recording position. */
+
+    if (AudioMoth_getSwitchPosition() != AM_SWITCH_USB) {
+
+        runTriggeredRecording();
+
+    }
+
+#endif
+
     AM_switchPosition_t switchPosition = AudioMoth_getSwitchPosition();
 
     if (AudioMoth_isInitialPowerUp()) {
@@ -1770,7 +1823,7 @@ int main(void) {
 
         /* Copy default deployment ID */
 
-        copyToBackupDomain((uint32_t*)deploymentID, (uint8_t*)defaultDeploymentID, DEPLOYMENT_ID_LENGTH);
+        initialiseDeploymentID();
 
     }
 
@@ -2778,9 +2831,14 @@ inline void AudioMoth_handleSwitchInterrupt() {
 
 }
 
-#if STFT_DEBUG_MODE
+#if STFT_DEBUG_MODE || TRIGGERED_RECORDING_MODE
 
-/* STFT feasibility test parameters - buffer is 1024 samples at 16kHz (64ms) */
+/* STFT feasibility test parameters - buffer is 1024 samples at 16kHz (64ms). Shared by
+   STFT_DEBUG_MODE (runSTFTFeasibilityTest()) and TRIGGERED_RECORDING_MODE
+   (runTriggeredRecording()) - the STFT/RMS/model-inference pipeline itself
+   (computeSpectrogram()/computeBufferGain()/resetRMSNormalization()) is identical for both;
+   only the parts specific to STFT_DEBUG_MODE's own CSV/BINARY debug-file output (further
+   below) are still gated on STFT_DEBUG_MODE alone. */
 
 #define STFT_SAMPLE_RATE                         16000
 
@@ -2858,7 +2916,9 @@ inline void AudioMoth_handleSwitchInterrupt() {
 #define STFT_MODE_SUFFIX                          "LINEAR"
 #endif
 
-/* CSV just logs buffer_index/elapsed time per buffer, as in the earlier log10f/vlog/linear comparisons - lightweight, no re-flash-free Python inspection. BINARY additionally saves the raw audio and full spectrogram of every buffer (see plot_stft_data.py), at the cost of a much bigger file and a per-buffer copy into external SRAM. */
+#if STFT_DEBUG_MODE
+
+/* CSV just logs buffer_index/elapsed time per buffer, as in the earlier log10f/vlog/linear comparisons - lightweight, no re-flash-free Python inspection. BINARY additionally saves the raw audio and full spectrogram of every buffer (see plot_stft_data.py), at the cost of a much bigger file and a per-buffer copy into external SRAM. Specific to STFT_DEBUG_MODE's own debug-file output - TRIGGERED_RECORDING_MODE writes real WAV files instead, see runTriggeredRecording(). */
 
 #define STFT_OUTPUT_MODE_CSV                      0
 #define STFT_OUTPUT_MODE_BINARY                   1
@@ -2869,6 +2929,8 @@ inline void AudioMoth_handleSwitchInterrupt() {
 #define STFT_DATA_FILENAME                        "STFT_DATA_" STFT_MODE_SUFFIX ".BIN"
 #else
 #define STFT_DATA_FILENAME                        "STFT_TIMING_" STFT_MODE_SUFFIX ".CSV"
+#endif
+
 #endif
 
 #if STFT_LOG_MODE == STFT_LOG_MODE_LOG10_FIXED
@@ -2901,7 +2963,9 @@ static inline float32_t stftFastLog10(float32_t x) {
 
 #endif
 
-/* Number of records buffered between the ISR (producer) and the main loop (consumer, writes to SD) */
+#if STFT_DEBUG_MODE
+
+/* Number of records buffered between the ISR (producer) and the main loop (consumer, writes to SD) - STFT_DEBUG_MODE's own debug-file queue; TRIGGERED_RECORDING_MODE has its own separate triggerQueue further below. */
 
 #define STFT_RECORD_QUEUE_LENGTH                  8
 
@@ -2945,6 +3009,8 @@ typedef struct {
 
 #pragma pack(pop)
 
+#endif
+
 static arm_rfft_fast_instance_f32 stftFFTInstance;
 
 static float32_t stftWindow[STFT_FFT_LENGTH];
@@ -2958,6 +3024,8 @@ static float32_t stftMagnitude[STFT_NUMBER_OF_BINS];
 /* Spectrogram of the buffer currently being processed. In BINARY output mode this is genuinely read (copied into a record below), but in CSV mode nothing ever reads it back - so it must stay volatile, otherwise the compiler proves the whole magnitude/log computation feeding it is dead and removes it, silently invalidating any timing measurement. */
 
 static volatile float32_t stftSpectrogramDb[STFT_NUMBER_OF_FRAMES][STFT_NUMBER_OF_BINS];
+
+#if STFT_DEBUG_MODE
 
 #if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
 
@@ -2979,9 +3047,12 @@ static volatile uint32_t stftRecordQueueReadIndex;
 
 static volatile uint32_t stftBufferCounter;
 
+#endif
+
 /* Persistent streaming RMS estimate (mean-square power, raw ADC scale) - see
    STFT_RMS_EMA_ALPHA's comment above. Reset once per recording (resetRMSNormalization(),
-   called from runSTFTFeasibilityTest() alongside ModelInference_reset()), then updated once
+   called from runSTFTFeasibilityTest() or runTriggeredRecording() alongside
+   ModelInference_reset()), then updated once
    per buffer by computeBufferGain() below - never reset mid-recording. */
 
 static float stftRunningMeanSq;
@@ -3022,15 +3093,14 @@ static float computeBufferGain(const int16_t *source) {
 
 }
 
-/* Replaces the normal recording ISR: instead of filtering the buffer into the SD card recording pipeline, compute its STFT and time how long that takes */
+/* Computes the RMS-normalized, high-pass-masked log-magnitude STFT of one 64ms buffer into
+   the shared stftSpectrogramDb - shared by STFT_DEBUG_MODE's ISR (timed separately from
+   ModelInference_run() there, for the existing per-stage CSV/BINARY output) and
+   TRIGGERED_RECORDING_MODE's ISR (which only needs the resulting logit, no per-stage
+   timing). Factored out unchanged from what was previously inlined directly in the
+   STFT-debug ISR - no behaviour change for that mode. */
 
-inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, int16_t **nextBuffer) {
-
-    int16_t *source = isPrimaryBuffer ? primaryBuffer : secondaryBuffer;
-
-    uint32_t startTime, startMicroseconds;
-
-    AudioMoth_getTimeMicroseconds(&startTime, &startMicroseconds);
+static void computeSpectrogram(const int16_t *source) {
 
     float bufferGain = computeBufferGain(source);
 
@@ -3133,6 +3203,22 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 #endif
 
     }
+
+}
+
+#if STFT_DEBUG_MODE
+
+/* Replaces the normal recording ISR: instead of filtering the buffer into the SD card recording pipeline, compute its STFT and time how long that takes */
+
+inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, int16_t **nextBuffer) {
+
+    int16_t *source = isPrimaryBuffer ? primaryBuffer : secondaryBuffer;
+
+    uint32_t startTime, startMicroseconds;
+
+    AudioMoth_getTimeMicroseconds(&startTime, &startMicroseconds);
+
+    computeSpectrogram(source);
 
     uint32_t endTime, endMicroseconds;
 
@@ -3343,6 +3429,518 @@ static void runSTFTFeasibilityTest(void) {
     }
 
 }
+
+#elif TRIGGERED_RECORDING_MODE
+
+/* Continuously listens and runs the classifier every 64ms buffer; whenever its output
+   crosses TRIGGER_LOGIT_THRESHOLD, records a new WAV file (with TRIGGER_PREROLL_SECONDS of
+   pre-roll audio), keeping it open while re-triggered (a sliding TRIGGER_TAIL_SECONDS
+   countdown, reset on every re-trigger) and closing it once the countdown lapses - one
+   distinct file per detection event, not one continuous file with gaps (unlike the existing
+   amplitude/frequency trigger feature in makeRecording() below, which never splits files). */
+
+/* sigmoid(0) = 0.5; the raw logit is compared directly (monotonic, so equivalent to a
+   probability threshold) to avoid an expf() call every buffer. Tune based on the PR-curve
+   data test-audiomoth-cnn/export_int8.py already produces. */
+
+#define TRIGGER_LOGIT_THRESHOLD                   -0.5596f
+
+#define TRIGGER_TAIL_SECONDS                      5.0f
+#define TRIGGER_PREROLL_SECONDS                   0.75f
+
+/* Whole 64ms buffers - the model's/ISR's own granularity - closest to
+   ceil(seconds / (MAXIMUM_SAMPLES_IN_DMA_TRANSFER/STFT_SAMPLE_RATE)). */
+
+#define TRIGGER_TAIL_BUFFERS                      79   /* ~5.056s actual */
+#define TRIGGER_PREROLL_BUFFERS                   12   /* ~0.768s actual */
+
+/* Power of two (indices masked with & (N-1)); usable capacity is TRIGGER_QUEUE_LENGTH-1 -
+   see triggerQueueFreeSlots() - which must stay comfortably above TRIGGER_PREROLL_BUFFERS
+   so a trigger onset's whole pre-roll burst can always be enqueued from empty. Under
+   sustained SD backlog this can still run out - see triggerQueueFreeSlots()'s call sites
+   in the ISR below for the accepted, documented failure mode (a dropped detection or a
+   dropped buffer, never a corrupted/inconsistent event sequence). */
+
+#define TRIGGER_QUEUE_LENGTH                      32
+
+#define TRIGGER_EVENT_NONE                        0
+#define TRIGGER_EVENT_START                       1
+#define TRIGGER_EVENT_CONTINUE                    2
+#define TRIGGER_EVENT_END                         3
+
+#pragma pack(push, 1)
+
+/* One record per buffer queued for the main loop to write - either part of a pre-roll
+   burst or a normal in-progress buffer. event tells the consumer whether to open a new
+   file before writing this buffer's audio (START), just write it (CONTINUE), or write it
+   then close the file (END). */
+
+typedef struct {
+    uint32_t bufferIndex;
+    int16_t audio[MAXIMUM_SAMPLES_IN_DMA_TRANSFER];
+    uint8_t event;
+} triggerRecord_t;
+
+#pragma pack(pop)
+
+/* External SRAM layout for this mode (see model_inference.c's ACTIVATION_BUFFER_BASE_OFFSET
+   comment for the full picture across all three of this firmware's mutually-exclusive
+   modes): pre-roll ring at offset 0 (24576 bytes), trigger queue right after at offset
+   24576 (65792 bytes, ending at 90368), the model's own activation buffers past that. */
+
+#define TRIGGER_PREROLL_RING_BASE_OFFSET          0
+#define TRIGGER_QUEUE_BASE_OFFSET                 24576
+
+/* Pre-roll ring: written unconditionally every ISR call, regardless of trigger state, so
+   the TRIGGER_PREROLL_BUFFERS buffers just before a detection are always available to flush
+   into a freshly-opened file - too big for internal RAM (24576 bytes). */
+
+static int16_t (*triggerPrerollRing)[MAXIMUM_SAMPLES_IN_DMA_TRANSFER] =
+    (int16_t(*)[MAXIMUM_SAMPLES_IN_DMA_TRANSFER])(AM_EXTERNAL_SRAM_START_ADDRESS + TRIGGER_PREROLL_RING_BASE_OFFSET);
+
+static volatile uint32_t triggerPrerollWriteIndex;
+
+/* Set once in runTriggeredRecording()'s init (see its own comment on why) - matches
+   makeRecording()'s DigitalFilter_setAdditionalGain(sampleMultiplier), just applied
+   directly to the samples here instead of folded into a DigitalFilter gain coefficient,
+   since this mode never calls DigitalFilter_applyFilter() at all. */
+
+static float triggerSampleMultiplier;
+
+/* Scales and clamps one buffer's raw ADC samples by triggerSampleMultiplier before they
+   reach the WAV file - never applied to what feeds computeSpectrogram()/ModelInference_run()
+   (see triggerSampleMultiplier's own comment). */
+
+static void copyScaledAudioForWav(int16_t *dst, const int16_t *src) {
+
+    for (uint32_t i = 0; i < MAXIMUM_SAMPLES_IN_DMA_TRANSFER; i += 1) {
+
+        float scaled = (float)src[i] * triggerSampleMultiplier;
+
+        if (scaled > (float)INT16_MAX) scaled = (float)INT16_MAX;
+
+        if (scaled < (float)(-INT16_MAX)) scaled = (float)(-INT16_MAX);
+
+        dst[i] = (int16_t)scaled;
+
+    }
+
+}
+
+/* Producer (ISR) / consumer (main loop) queue - same pattern as STFT_DEBUG_MODE's
+   stftRecordQueue, just carrying event-tagged raw audio instead of debug/timing data. */
+
+static triggerRecord_t *triggerQueue = (triggerRecord_t*)(AM_EXTERNAL_SRAM_START_ADDRESS + TRIGGER_QUEUE_BASE_OFFSET);
+
+static volatile uint32_t triggerQueueWriteIndex;
+
+static volatile uint32_t triggerQueueReadIndex;
+
+static volatile uint32_t triggerBufferCounter;
+
+/* Free slots left in triggerQueue, reserving one slot always empty so a genuinely full
+   queue (write index having wrapped all the way back around to the read index) can never
+   be numerically mistaken for an empty one - the classic power-of-two ring buffer
+   ambiguity, avoided here by never letting occupancy reach the full TRIGGER_QUEUE_LENGTH. */
+
+static uint32_t triggerQueueFreeSlots(void) {
+
+    uint32_t usedSlots = (triggerQueueWriteIndex - triggerQueueReadIndex) & (TRIGGER_QUEUE_LENGTH - 1);
+
+    return (TRIGGER_QUEUE_LENGTH - 1) - usedSlots;
+
+}
+
+inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, int16_t **nextBuffer) {
+
+    int16_t *source = isPrimaryBuffer ? primaryBuffer : secondaryBuffer;
+
+    computeSpectrogram(source);
+
+    float logit = ModelInference_run(stftSpectrogramDb, NULL);
+
+    /* Pre-roll ring: always updated, regardless of trigger state - after this copy its
+       newest entry is always the current buffer. Scaled for the WAV file here (see
+       triggerSampleMultiplier's comment) - computeSpectrogram()/ModelInference_run() above
+       already ran on the unscaled source, which is what they need. */
+
+    copyScaledAudioForWav(triggerPrerollRing[triggerPrerollWriteIndex], source);
+
+    triggerPrerollWriteIndex = (triggerPrerollWriteIndex + 1) % TRIGGER_PREROLL_BUFFERS;
+
+    static bool recordingActive;
+
+    static uint32_t tailCountdown;
+
+    bool triggered = logit > TRIGGER_LOGIT_THRESHOLD;
+
+    if (recordingActive == false) {
+
+        /* Trigger onset: flush the whole pre-roll ring (walking forward from the slot
+           about to be overwritten next - the oldest live entry - wrapping around to end on
+           the buffer just written above, i.e. oldest to newest) as one all-or-nothing
+           burst, so the consumer never sees a CONTINUE/END record with no preceding START -
+           either the whole burst is enqueued, or none of it is. */
+
+        if (triggered && triggerQueueFreeSlots() >= TRIGGER_PREROLL_BUFFERS) {
+
+            for (uint32_t i = 0; i < TRIGGER_PREROLL_BUFFERS; i += 1) {
+
+                uint32_t ringIndex = (triggerPrerollWriteIndex + i) % TRIGGER_PREROLL_BUFFERS;
+
+                triggerQueue[triggerQueueWriteIndex].bufferIndex = triggerBufferCounter;
+
+                memcpy(triggerQueue[triggerQueueWriteIndex].audio, triggerPrerollRing[ringIndex], sizeof(triggerQueue[0].audio));
+
+                triggerQueue[triggerQueueWriteIndex].event = (i == 0) ? TRIGGER_EVENT_START : TRIGGER_EVENT_CONTINUE;
+
+                triggerQueueWriteIndex = (triggerQueueWriteIndex + 1) & (TRIGGER_QUEUE_LENGTH - 1);
+
+            }
+
+            recordingActive = true;
+
+            tailCountdown = TRIGGER_TAIL_BUFFERS;
+
+        }
+
+    } else if (triggerQueueFreeSlots() >= 1) {
+
+        triggerQueue[triggerQueueWriteIndex].bufferIndex = triggerBufferCounter;
+
+        copyScaledAudioForWav(triggerQueue[triggerQueueWriteIndex].audio, source);
+
+        bool isLastBuffer;
+
+        if (triggered) {
+
+            tailCountdown = TRIGGER_TAIL_BUFFERS;
+
+            isLastBuffer = false;
+
+        } else {
+
+            tailCountdown -= 1;
+
+            isLastBuffer = tailCountdown == 0;
+
+        }
+
+        triggerQueue[triggerQueueWriteIndex].event = isLastBuffer ? TRIGGER_EVENT_END : TRIGGER_EVENT_CONTINUE;
+
+        triggerQueueWriteIndex = (triggerQueueWriteIndex + 1) & (TRIGGER_QUEUE_LENGTH - 1);
+
+        if (isLastBuffer) recordingActive = false;
+
+    }
+
+    /* If neither branch above enqueued anything (idle with no trigger, or the queue was
+       too full), nothing happens this buffer - cheap, no wasted SD bandwidth. */
+
+    triggerBufferCounter += 1;
+
+}
+
+/* WAV file state for the triggered recording currently open, if any - persists across
+   AudioMoth_sleep() iterations of runTriggeredRecording()'s main loop below, since a single
+   file spans many drain cycles, not just one. */
+
+static bool triggerFileOpen;
+
+static uint32_t triggerSamplesWrittenThisFile;
+
+static char triggerFilename[MAXIMUM_FILE_NAME_LENGTH];
+
+static char triggerFoldername[MAXIMUM_FILE_NAME_LENGTH];
+
+/* Opens a new WAV file named from the current time, writes a placeholder header (corrected
+   at close time once the true sample count is known - same open-placeholder-header/write-
+   data/seek-back/rewrite-header/close pattern makeRecording() uses further below, just
+   without its 32KB-buffer-specific "overwrite part of the first audio buffer with the
+   header" optimization - not needed here since every record is already a small standalone
+   write). No GUANO metadata chunk (deployment/GPS/battery/temperature) for this mode - easy
+   follow-up later via the existing writeGuanoData() if wanted. On any failure, flashes the
+   red LED and leaves triggerFileOpen false - a transient SD hiccup loses at most this one
+   file, not the whole listening session. */
+
+static void openTriggeredWavFile(void) {
+
+    uint32_t currentTime, currentMilliseconds;
+
+    AudioMoth_getTime(&currentTime, &currentMilliseconds);
+
+    generateFolderAndFilename(triggerFoldername, triggerFilename, currentTime, true);
+
+    bool success = true;
+
+    if (configSettings->enableDailyFolders && AudioMoth_doesDirectoryExist(triggerFoldername) == false) {
+
+        success = AudioMoth_makeDirectory(triggerFoldername);
+
+    }
+
+    if (success) success = AudioMoth_openFile(triggerFilename);
+
+    if (success) {
+
+        setHeaderDetails(&wavHeader, STFT_SAMPLE_RATE, 0, 0);
+
+        success = AudioMoth_writeToFile(&wavHeader, sizeof(wavHeader_t));
+
+        if (success == false) AudioMoth_closeFile();
+
+    }
+
+    if (success == false) {
+
+        AudioMoth_setRedLED(true);
+
+        AudioMoth_delay(100);
+
+        AudioMoth_setRedLED(false);
+
+    }
+
+    triggerFileOpen = success;
+
+    triggerSamplesWrittenThisFile = 0;
+
+    /* Solid (not blinking) green LED for the whole time a file is open, unlike the default
+       firmware's brief activity flashes - see closeTriggeredWavFile() and drainTriggerQueue()
+       for the other two places this must be kept in sync with triggerFileOpen. */
+
+    AudioMoth_setGreenLED(success);
+
+}
+
+/* Finalizes the currently-open file's header with the true sample count and closes it.
+   Best-effort: even if a step fails, triggerFileOpen is unconditionally cleared afterwards
+   and AudioMoth_closeFile() is still called, so the state machine can never get stuck
+   believing a file is open that isn't. */
+
+static void closeTriggeredWavFile(void) {
+
+    bool success = AudioMoth_seekInFile(0);
+
+    if (success) {
+
+        setHeaderDetails(&wavHeader, STFT_SAMPLE_RATE, triggerSamplesWrittenThisFile, 0);
+
+        success = AudioMoth_writeToFile(&wavHeader, sizeof(wavHeader_t));
+
+    }
+
+    AudioMoth_closeFile();
+
+    if (success == false) {
+
+        AudioMoth_setRedLED(true);
+
+        AudioMoth_delay(100);
+
+        AudioMoth_setRedLED(false);
+
+    }
+
+    triggerFileOpen = false;
+
+    AudioMoth_setGreenLED(false);
+
+}
+
+/* Writes every queued record to the currently-open file (opening/closing it as directed by
+   each record's event), until the queue is empty. Shared by the normal wake-up drain below
+   and the switch-to-USB bail path, so a full drain always happens the same way in both. */
+
+static void drainTriggerQueue(void) {
+
+    while (triggerQueueReadIndex != triggerQueueWriteIndex) {
+
+        triggerRecord_t *record = &triggerQueue[triggerQueueReadIndex];
+
+        if (record->event == TRIGGER_EVENT_START) openTriggeredWavFile();
+
+        if (triggerFileOpen) {
+
+            if (AudioMoth_writeToFile(record->audio, NUMBER_OF_BYTES_IN_SAMPLE * MAXIMUM_SAMPLES_IN_DMA_TRANSFER)) {
+
+                triggerSamplesWrittenThisFile += MAXIMUM_SAMPLES_IN_DMA_TRANSFER;
+
+                AudioMoth_syncFile();
+
+            } else {
+
+                triggerFileOpen = false;
+
+                AudioMoth_setGreenLED(false);
+
+            }
+
+        }
+
+        if (record->event == TRIGGER_EVENT_END && triggerFileOpen) closeTriggeredWavFile();
+
+        triggerQueueReadIndex = (triggerQueueReadIndex + 1) & (TRIGGER_QUEUE_LENGTH - 1);
+
+    }
+
+}
+
+/* Standalone entry point: continuously listen and record a new WAV file per detection
+   event - see this mode's top-of-block comment for the overall behaviour. */
+
+static void runTriggeredRecording(void) {
+
+    /* Precompute the Hann analysis window and initialise the FFT - same as
+       runSTFTFeasibilityTest() above, see its own comment on why
+       arm_rfft_fast_init_256_f32() is called directly instead of the generic
+       arm_rfft_fast_init_f32() dispatcher (costs ~69KB of unused twiddle tables otherwise,
+       see EXPERIMENTS.md). */
+
+    for (uint32_t i = 0; i < STFT_FFT_LENGTH; i += 1) {
+
+        stftWindow[i] = 0.5f - 0.5f * cosf(STFT_TWO_PI * (float32_t)i / (float32_t)(STFT_FFT_LENGTH - 1));
+
+    }
+
+#if STFT_FFT_LENGTH != 256
+#error "arm_rfft_fast_init_256_f32() below is hard-coded for STFT_FFT_LENGTH==256"
+#endif
+
+    arm_rfft_fast_init_256_f32(&stftFFTInstance);
+
+    /* On a genuine cold boot straight into this mode, main()'s normal power-up block (which
+       seeds deploymentID) never runs - see initialiseDeploymentID()'s own comment for why
+       this doesn't risk calling AudioMoth_isInitialPowerUp() twice in the same run. */
+
+    if (AudioMoth_isInitialPowerUp()) {
+
+        initialiseDeploymentID();
+
+    }
+
+    /* Wait for the SD card to be ready before doing anything else - same retry-with-LED
+       pattern as runSTFTFeasibilityTest(), just without a single upfront file to open,
+       since files are opened per detection event here instead. */
+
+    bool sdCardReady = false;
+
+    while (sdCardReady == false) {
+
+        sdCardReady = AudioMoth_enableFileSystem(AM_SD_CARD_NORMAL_SPEED);
+
+        if (sdCardReady == false) {
+
+            AudioMoth_setRedLED(true);
+
+            AudioMoth_delay(100);
+
+            AudioMoth_setRedLED(false);
+
+            AudioMoth_delay(900);
+
+        }
+
+    }
+
+    /* Enable the microphone at a raw, undecimated 16kHz (no software decimation filter) -
+       clockDivider/acquisitionCycles/oversampleRate are fixed at 4/16/1 regardless of
+       configSettings (same as runSTFTFeasibilityTest()), since the model was trained on
+       exactly this raw sample rate/ADC timing and changing them would feed it something
+       different from what it expects. Gain and gain range, unlike those, don't affect the
+       model's input assumptions - only loudness - so THOSE come from configSettings, same
+       as makeRecording() below, so a triggered recording sounds like what this device's
+       configured gain (set via the AudioMoth Config App) actually produces, not a fixed
+       AM_GAIN_MEDIUM regardless of what's configured (the bug this replaced: recordings
+       came out noticeably quieter than normal deployments using a higher configured gain). */
+
+    AudioMoth_enableExternalSRAM();
+
+    AudioMoth_ignoreExternalMicrophone(false);
+
+    AM_gainRange_t triggerGainRange = configSettings->enableLowGainRange ? AM_LOW_GAIN_RANGE : AM_NORMAL_GAIN_RANGE;
+
+    AM_externalMicrophone_t triggerExternalMicrophone = AudioMoth_enableMicrophone(triggerGainRange, configSettings->gain, 4, 16, 1);
+
+    AudioMoth_initialiseDirectMemoryAccess(primaryBuffer, secondaryBuffer, MAXIMUM_SAMPLES_IN_DMA_TRANSFER);
+
+    /* makeRecording() below applies this same "sample multiplier" to every sample via
+       DigitalFilter_setAdditionalGain() (folded into DigitalFilter_applyFilter()'s own
+       filter gain) - with oversampleRate/sampleRateDivider fixed at 1/1 for this mode (see
+       the comment above), that's a constant 16.0f: the AudioMoth ADC's raw one-shot reading
+       (oversampleRate=1, no hardware oversampling) sits at a fixed fraction of the standard
+       int16 full-scale convention that oversampleRate=16 (the usual default) reaches
+       without any correction, so leaving this unapplied - as this mode did until now, since
+       it never calls DigitalFilter_applyFilter() at all, sampling raw via DMA directly -
+       made every triggered recording come out ~16x (~24dB) quieter than a normal one at the
+       same configured gain. Deliberately applied ONLY to the copies feeding the WAV file
+       (see copyScaledAudioForWav() below) - never to what feeds computeSpectrogram()/
+       ModelInference_run(), whose calibration (RMS normalization target, INT8 quantization
+       scales) is tied to this same raw, unscaled ADC convention the model was trained and
+       validated against (see EXPERIMENTS.md) - scaling that input too would be a real
+       train/inference mismatch, not a fix. */
+
+    triggerSampleMultiplier = 16.0f / (float)(1 * 1);
+
+    if (AudioMoth_hasInvertedOutput()) triggerSampleMultiplier = -triggerSampleMultiplier;
+
+    if (triggerExternalMicrophone == AM_EXTERNAL_PRESENT_AND_USED) triggerSampleMultiplier = -triggerSampleMultiplier;
+
+    triggerBufferCounter = 0;
+
+    triggerPrerollWriteIndex = 0;
+
+    triggerQueueWriteIndex = 0;
+
+    triggerQueueReadIndex = 0;
+
+    triggerFileOpen = false;
+
+    AudioMoth_setGreenLED(false);
+
+    ModelInference_reset();
+
+    resetRMSNormalization();
+
+    AudioMoth_startMicrophoneSamples(STFT_SAMPLE_RATE);
+
+    while (true) {
+
+        /* Re-checked every cycle (~64ms), same as runSTFTFeasibilityTest(), so flipping the
+           switch to USB at any time lets the device fall through to normal USB handling and
+           be reflashed. Disables the microphone FIRST (stops the ISR from enqueueing
+           anything further), THEN fully drains whatever is left in the queue into the
+           currently-open file (so a last fraction of a second of already-captured audio
+           isn't silently discarded), THEN finalizes and closes that file if one is open. */
+
+        if (AudioMoth_getSwitchPosition() == AM_SWITCH_USB) {
+
+            AudioMoth_disableMicrophone();
+
+            drainTriggerQueue();
+
+            if (triggerFileOpen) closeTriggeredWavFile();
+
+            return;
+
+        }
+
+        drainTriggerQueue();
+
+        AudioMoth_sleep();
+
+    }
+
+}
+
+#endif
+
+/* Neither debug mode active - restores the normal recording firmware (STFT_DEBUG_MODE and
+   TRIGGERED_RECORDING_MODE are both 0). This #else belongs to the OUTER
+   `#if STFT_DEBUG_MODE || TRIGGERED_RECORDING_MODE` opened at the top of this whole shared
+   STFT/model-inference block, not the STFT_DEBUG_MODE/TRIGGERED_RECORDING_MODE #if/#elif
+   pair just closed above - the normal ISR must NOT be nested inside code that only compiles
+   when one of those two modes is active. */
 
 #else
 

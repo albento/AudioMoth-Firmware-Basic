@@ -460,6 +460,158 @@ earlier measurement. Inference time is unchanged within timer-quantization noise
 arithmetic it does), confirming the correctness fixes cost nothing in the real-time budget -
 margin stays at ~41.6% of the 64ms buffer.
 
+## Model training: two more real bugs, and results from the fixed pipeline
+
+Real-world testing of `TRIGGERED_RECORDING_MODE` (previous checkpoint) surfaced two further
+train/inference mismatches, both fixed in `test-audiomoth-cnn` (not this repo) and both now
+folded into the retrained checkpoint below:
+
+- **Buffer-restarted CNN backbone.** `TinyLSTMCNN.frame_logits()` (and `export_int8.py`'s
+  `float_forward_with_traces()`/`int8_forward()`, independent reimplementations) ran the 5-stage
+  conv backbone *continuously* over a whole training clip's spectrogram, giving every conv
+  layer several buffers' worth of real cross-frame receptive field. `ModelInference_run()` on
+  the device restarts the same backbone fresh every 64ms buffer, with zero cross-buffer
+  receptive field - only the LSTM carries state across buffers. Confirmed structurally different
+  (not quantization noise) via a known-positive eval clip: 0.6-0.95 confidence under the
+  continuous evaluation, ~0.13-0.18 under a buffer-restarted replica of the real firmware
+  computation. Fixed by making `frame_logits()` itself buffer-restart the conv stack
+  (`student_model._per_buffer_pooled_features()`), and `export_int8.py`'s two independent
+  reimplementations to match, backed by a new direct consistency check between them (previously
+  nothing enforced they agreed).
+- **RMS-normalization convergence gap.** The streaming RMS normalizer (`streaming_rms_normalize()`,
+  same EMA both in training and in `computeBufferGain()`/`resetRMSNormalization()` on-device)
+  seeds its running estimate from a fixed "assume nominal level" constant and adapts from
+  there. Training clips (`CLIP_SECONDS=3.0` at the time, ~1 EMA time constant) seeded
+  `initial_rms` from each clip's own true RMS - so the model only ever saw an estimate that was
+  *already close to right* for a clip's whole (short) duration, never a real *mid-clip
+  convergence* (estimate starts wrong, drifts toward correct partway through), which is exactly
+  what happens on a real, longer recording session on-device. Confirmed on a real 82s field
+  recording of speech: short 3s windows re-seeded with their own true RMS scored 0.70-0.77
+  peak probability; the same moments scored via one continuous whole-file pass (fixed-seed EMA
+  drifting for 82s) scored only 0.10-0.27 at the identical positions. Fixed by retraining on much
+  longer clips (`CLIP_SECONDS=12.0`, ~4 EMA time constants - long enough for real mid-clip
+  convergence) with multiple independently-leveled speech segments per positive clip (SNR
+  widened from a fixed 5-15dB to -5-20dB, 1-4 segments instead of 1) for genuine relative-volume
+  diversity beyond what RMS normalization + per-clip jitter alone provide - **and** a
+  since-caught-and-fixed coupling bug where the EMA time constant itself was accidentally
+  derived from `CLIP_SECONDS` (`dataset.py`), which would have silently invalidated the whole
+  fix by stretching the training-time EMA to match the longer clips instead of staying pinned
+  to the firmware's real, fixed ~3s constant.
+
+### Evaluation results: `lstm_small_16` (no focal loss), buffer-restarted + longer/volume-diverse retrain
+
+| | AP | Precision @ recall≥95% (threshold) | n |
+|---|---|---|---|
+| Clip-level | 99.6% | **99.3%** (threshold=0.9546) | 2000 |
+| Frame-level | 91.4% | **47.5%** (threshold=0.0561) | 374000 |
+
+**Going forward, judge model quality primarily by precision @ recall≥95%, not raw AP** (user
+preference, this entry on) - AP averages precision across every recall level including ones far
+below what a usable detector would ever operate at, while precision-at-high-recall reflects the
+actual operating point ("catch ~everything, how many false positives does that cost") a real
+deployment cares about. Note the frame-level and clip-level thresholds for the same recall
+target are very different (0.056 vs 0.95, both as raw probabilities) - the firmware makes a
+per-buffer (frame-level) decision in real time, never a per-clip aggregate one, so
+`TRIGGER_LOGIT_THRESHOLD` (`src/main.c`) should be calibrated against the **frame-level** PR
+curve, not the clip-level one, or it will end up far stricter than intended.
+
+## Triggered recording: a new WAV file per detection event
+
+A third top-level firmware mode, `TRIGGERED_RECORDING_MODE` (mutually exclusive with
+`STFT_DEBUG_MODE`, `src/main.c`), continuously listens and runs the classifier every 64ms
+buffer via the same shared STFT/RMS/high-pass pipeline (factored into `computeSpectrogram()`
+so both debug modes reuse it unchanged). Whenever the logit crosses `TRIGGER_LOGIT_THRESHOLD`,
+it opens a new WAV file (with `TRIGGER_PREROLL_SECONDS` ≈ 0.75s of pre-roll audio from a
+small always-on ring buffer, so the true onset of the sound isn't clipped), keeps recording
+while re-triggered (`TRIGGER_TAIL_SECONDS` = 5s countdown, reset on every re-trigger - a
+sliding window, not a hard cap), and closes the file once the countdown lapses - one distinct
+file per detection event, unlike the existing amplitude/frequency trigger feature in
+`makeRecording()`, which only ever keeps one continuous file with compression-encoded gaps.
+
+Reuses the existing WAV header/filename machinery (`wavHeader_t`, `setHeaderDetails()`,
+`generateFolderAndFilename()`, already supporting a `T.WAV`-suffixed name via a bool arg) and
+the established ISR-producer/main-loop-consumer ring-buffer pattern (`stftRecordQueue`'s
+precedent), with its own dedicated external-SRAM regions (pre-roll ring, event-tagged audio
+queue, sized/offset to not overlap the model's activation buffers - see
+`model_inference.c`'s `ACTIVATION_BUFFER_BASE_OFFSET` comment for the full layout). A solid
+(non-blinking) green LED stays on for the whole time a file is open, distinct from the
+default firmware's brief red activity flashes.
+
+A design-review pass (before writing any code) caught several real bugs that would otherwise
+have shipped: an external-SRAM offset collision between the new trigger queue and the model's
+activation buffers (both would have silently corrupted each other), a burst-enqueue race that
+could leave the consumer with a `CONTINUE`/`END` record and no preceding `START` under SD
+backlog (fixed by making a trigger onset's whole pre-roll flush all-or-nothing), and an
+uninitialized-backup-RAM bug where a cold boot straight into this mode would skip the normal
+firmware's `deploymentID` seeding, embedding electrically-arbitrary bytes in every filename
+if `enableFilenameWithDeviceID` was set (fixed by factoring that seeding into
+`initialiseDeploymentID()`, called from both places).
+
+### ISR timing verification (real hardware)
+
+The existing ~37ms/64ms STFT+inference figure never included any external-SRAM write cost -
+the STFT-debug measurement explicitly excludes its own record-queue memcpy from the timed
+region. This mode adds two new SRAM-write costs with no prior measurement: an always-on 2KB
+pre-roll copy (every buffer) and a burst of up to 12 extra 2KB copies (only on trigger
+onset, flushing the whole pre-roll ring into the queue in one ISR call) - measured with a
+temporary instrumented build (`TRIGGER_TIMING_TEST`, since removed) logging per-buffer ISR
+elapsed time to `TRIGGER_TIMING.TXT`:
+
+| | ISR time | % of 64ms budget | Margin |
+|---|---|---|---|
+| Idle (no detection, 206 buffers) | 37812 µs | 59.1% | ~26.2ms |
+| **Worst case (trigger-onset burst, `TRIGGER_LOGIT_THRESHOLD` temporarily forced to -10.0f to guarantee a trigger)** | **45624 µs** | **71.3%** | **~18.4ms (28.7%)** |
+
+The burst itself costs ~7.8ms (45624 - 37812 µs) - consistent with external SRAM via EBI
+being slower than flash (see "Memory footprint" above), for 12 extra 2KB copies (~650µs
+each). Even the worst case leaves ~28.7% of the buffer's real-time budget free - the design
+fits with comfortable margin, no optimization needed. Confirmed on real hardware, not
+estimated - same discipline as every other timing claim in this document.
+
+### Two real bugs found via first real recordings: wrong gain, and a missing ~16x sample scale
+
+The first triggered recordings, tested on real hardware, came out noticeably quieter than
+normal deployments made in similar conditions - two independent, compounding bugs, both in
+how `runTriggeredRecording()` set up the microphone (copied from `runSTFTFeasibilityTest()`,
+a test harness never meant to produce real listenable recordings):
+
+1. **Hardcoded gain.** `AudioMoth_enableMicrophone(AM_NORMAL_GAIN_RANGE, AM_GAIN_MEDIUM, 4,
+   16, 1)` ignored the device's actual configured gain entirely - `makeRecording()` uses
+   `configSettings->gain` and `configSettings->enableLowGainRange` (set via the AudioMoth
+   Config App), so any deployment configured above `medium` gain would always sound quieter
+   from this mode regardless. Fixed by reading `configSettings->gain`/
+   `enableLowGainRange` the same way `makeRecording()` does - `clockDivider`/
+   `acquisitionCycles`/`oversampleRate` stay hardcoded at `4`/`16`/`1`, since those (unlike
+   gain) do affect what the model expects as input and must stay tied to the raw 16kHz
+   configuration it was trained on, not the user's configured recording quality.
+
+2. **Missing ~16x (~24dB) sample scale - the bigger effect.** `makeRecording()` never writes
+   raw ADC samples to a WAV file directly - every sample passes through
+   `DigitalFilter_applyFilter()`, which folds in an additional gain
+   (`DigitalFilter_setAdditionalGain()`, `sampleMultiplier = 16.0f / (oversampleRate *
+   sampleRateDivider)`) as part of its own filter coefficient (confirmed by reading
+   `digitalfilter.c`'s `applyHighPassFilter()`/`applyBandPassFilter()`, both of which
+   multiply the incoming sample by this folded-in `gain` before any filtering happens, on
+   every sample, filter type notwithstanding). With `oversampleRate=1` (this mode's raw,
+   non-oversampled ADC reading - the same convention `STFT_DEBUG_MODE`'s BINARY capture and
+   the model's whole training pipeline use), that multiplier is a constant `16.0f`: the
+   AudioMoth ADC's raw one-shot reading at `oversampleRate=1` sits at a fixed fraction of
+   the standard int16 full-scale convention that `oversampleRate=16` (the usual default)
+   reaches without correction. `runTriggeredRecording()` samples directly via DMA and never
+   calls `DigitalFilter_applyFilter()` at all, so this scaling was never applied - every
+   triggered recording was ~16x (~24dB) quieter than it should have been, independent of
+   the gain-setting bug above and much larger in effect.
+
+   Fixed by computing the same `triggerSampleMultiplier` (`16.0f` here, plus the same
+   `AudioMoth_hasInvertedOutput()`/external-microphone sign handling `makeRecording()` uses)
+   once at startup, and applying it (with clamping to `±INT16_MAX`) only to the two copies
+   of `source` that feed the pre-roll ring / trigger queue (`copyScaledAudioForWav()`) -
+   **deliberately not** to what `computeSpectrogram()`/`ModelInference_run()` consume: the
+   model's calibration (streaming RMS normalization target, INT8 quantization scales) is
+   tied to the same raw, unscaled ADC convention it was trained and validated against (see
+   the device-vs-PC parity section above) - scaling that input too would silently reintroduce
+   a train/inference mismatch, not fix one.
+
 ## Operational notes from this debug branch
 
 - A custom `main()` that unconditionally bypasses the switch-position check also bypasses

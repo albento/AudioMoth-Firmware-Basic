@@ -617,7 +617,168 @@ toujours le pipeline entier après chaque changement, pas seulement l'étage mod
 
 ---
 
-## 13. Récapitulatif des bugs rencontrés (pour check-list de non-régression)
+## 13. Pièges d'entraînement (parité entraînement/déploiement)
+
+Tout ce qui précède concerne le firmware et l'export - cette section couvre des bugs trouvés
+**côté entraînement** (`test-audiomoth-cnn`, pas ce dépôt), découverts après coup en testant le
+modèle déployé sur de vrais enregistrements de terrain. Le principe général qui les relie : la
+fonction d'entraînement doit calculer **exactement** ce que le firmware calcule en déploiement
+réel, pas une version "proche" ou "plus naturelle à coder" - deux fois de suite, une version
+plus simple/continue à coder a silencieusement divergé d'une contrainte réelle du déploiement
+streaming.
+
+### 13.1 Le CNN doit être relancé par buffer à l'entraînement aussi
+
+Le bug le plus significatif de toute cette investigation, plus grave que n'importe quel bug
+firmware du §13 (bugs) ci-dessous : `TinyLSTMCNN.frame_logits()` (`student_model.py`) faisait
+tourner les 5 étages de convolution **en continu** sur tout le spectrogramme d'un clip
+d'entraînement (un seul appel `self.features(spectrogram.unsqueeze(1))` sur la séquence
+entière) - donnant à chaque couche de conv un vrai champ réceptif temporel de plusieurs
+buffers, via l'empilement de 3 convolutions à stride 2. Le firmware réel
+(`ModelInference_run()`, §6-9 ci-dessus) relance ce même empilement **à zéro à chaque buffer de
+64ms**, ne voyant jamais que les 7 frames STFT de ce buffer - aucun champ réceptif inter-buffer
+pour les couches de conv, seul le LSTM porte un état entre buffers.
+
+Ce n'est **pas** du bruit de quantification - un vrai écart structurel de calcul, confirmé sur
+un extrait connu positif du jeu d'évaluation : confiance 0.6-0.95 sous l'évaluation continue,
+~0.13-0.18 sous une réplique du calcul réel relancé par buffer, sur le **même** modèle flottant
+non quantifié.
+
+Corrigé en faisant en sorte que `frame_logits()` relance lui-même le CNN par buffer
+(`_per_buffer_pooled_features()`, `student_model.py`) : reshape/permute le spectrogramme `[B,
+F, T]` pour replier l'axe des buffers dans l'axe batch (`[B*num_buffers, 1, F,
+frames_per_buffer]`), un seul appel batché à `self.features` (équivalent à `num_buffers` appels
+séparés, mais bien plus rapide), puis reshape retour vers `[B, num_buffers, C]` avant de nourrir
+le `temporal_context` (LSTM/Conv1d) **une seule fois, en continu**, sur toute la séquence - c'est
+justement ce qui donne la mémoire inter-buffer, comme l'état LSTM persistant du firmware.
+
+Piège associé : `export_int8.py` a **deux réimplémentations indépendantes** du même calcul
+(`float_forward_with_traces()`, en `F.conv2d` brut sur poids BN-fusionnés ; `int8_forward()`, en
+`sim.conv2d_s8`) qui ne passent PAS par `frame_logits()` - elles avaient exactement le même bug,
+séparément, et ont eu besoin du même correctif séparément. Rien ne garantissait que ces
+implémentations concordaient entre elles ; un test de cohérence directe
+(`model.frame_logits(spec)` vs `float_forward_with_traces(...)["logits"]`) a été ajouté après
+coup pour fermer ce risque.
+
+**Leçon générale** : dès qu'un déploiement réel a une contrainte de calcul par morceaux
+(streaming, buffer par buffer, fenêtre glissante...), **toute** réimplémentation du forward
+pass - entraînement, évaluation, ré-export - doit respecter cette même contrainte exactement,
+même si une version continue "look correcte" et s'entraîne sans erreur. Une divergence de ce
+type ne casse rien syntaxiquement, elle dégrade juste silencieusement la qualité réelle du
+modèle déployé.
+
+### 13.2 La constante de temps de l'EMA ne doit jamais dépendre de la durée du clip d'entraînement
+
+Bug plus subtil, découvert en corrigeant un autre problème (voir 13.3) : `dataset.py` calculait
+`RMS_EMA_BUFFERS = CLIP_SECONDS / (BUFFER_SAMPLES / SAMPLE_RATE)` - dérivant la constante de
+temps de la moyenne glissante RMS de la **durée du clip d'entraînement**. Mais côté firmware,
+`STFT_RMS_EMA_BUFFERS = 46.875f` (`main.c`) est une constante **fixe**, ~3 secondes réelles,
+sans aucune notion de "durée de clip" (un enregistrement réel n'en a pas). Les deux ne
+coïncidaient que parce que `CLIP_SECONDS` valait justement 3.0 au moment où la formule a été
+écrite - changer `CLIP_SECONDS` (par exemple pour donner au modèle de vrais clips plus longs,
+voir 13.3) aurait silencieusement étiré aussi la constante de temps de l'EMA côté entraînement,
+désynchronisant le comportement appris du comportement réel du firmware, sans qu'aucune erreur
+ne le signale.
+
+**Leçon générale** : la constante de temps d'une statistique causale/glissante est une propriété
+du système déployé en temps réel (secondes réelles), jamais une fonction de la manière dont on a
+découpé les données d'entraînement. Toujours vérifier qu'un tel paramètre reste **fixé, pas
+dérivé**, si on touche à la façon dont les clips d'entraînement sont construits.
+
+### 13.3 Diversité de volume dans les données d'entraînement
+
+Pourquoi ce bug d'EMA a été trouvé : le modèle échouait sur un vrai enregistrement de terrain de
+82s (voix humaine) qu'il reconnaissait bien avant ces changements. Diagnostic : des fenêtres de
+3s extraites de ce même fichier, réamorcées avec leur propre RMS réel, obtiennent 0.70-0.77 de
+confiance ; les mêmes instants évalués en continu sur le fichier entier (amorce EMA fixe,
+dérivant pendant 82s) n'obtiennent que 0.10-0.27. Cause racine : les clips d'entraînement
+(`CLIP_SECONDS=3.0` à l'époque) ne duraient qu'~1 constante de temps de l'EMA, et étaient
+toujours amorcés proches du bon niveau (RMS réel du clip ± un facteur aléatoire) - le modèle
+n'avait jamais vu de vraie **convergence en cours de clip** (estimation qui part fausse et
+dérive vers le bon niveau en cours de route), alors que c'est exactement ce qui se passe sur un
+vrai enregistrement continu de plusieurs minutes.
+
+Corrigé en réentraînant sur des clips bien plus longs (`CLIP_SECONDS=12.0`, ~4 constantes de
+temps de l'EMA - assez pour une vraie convergence en cours de clip) et en insérant plusieurs
+segments de parole à niveaux (SNR) indépendamment tirés par clip positif
+(`generate_vad_sanity_dataset.py`, SNR élargi de 5-15dB fixe à -5-20dB, 1 à 4 segments non
+chevauchants au lieu d'un seul) - une diversité de niveau relatif plus directe que ce que la
+normalisation RMS + le jitter par clip fournissent seuls.
+
+Alternative envisagée puis écartée : supprimer entièrement la normalisation RMS et compter sur
+la seule diversité des données. Gardée malgré tout, car elle limite la plage dynamique réelle en
+entrée de la quantification INT8 (§7) - sans elle, l'échelle fixe de quantification devrait
+couvrir une plage bien plus large, réduisant la précision effective sur les niveaux "typiques"
+et risquant de noyer les signaux faibles/lointains dans le bruit de quantification.
+
+### 13.4 Choisir la bonne métrique : précision à rappel élevé, pas l'AP brute
+
+L'AP (average precision) moyenne la précision sur **tous** les niveaux de rappel, y compris des
+niveaux bien en dessous de ce qu'un détecteur utilisable viserait jamais en pratique. Convention
+retenue pour ce projet : juger un modèle par sa **précision au seuil qui atteint un rappel
+≥95%** - reflète directement le compromis réel ("si je veux capter ~tout, combien de faux
+positifs ça coûte ?").
+
+Piège pratique : le seuil correspondant à rappel≥95% est très différent au niveau clip et au
+niveau frame (mesuré : 0.9546 vs 0.0561, sur le même modèle) - normal, un clip de plusieurs
+secondes n'a besoin que d'**un seul** frame positif pour être positif au niveau clip, donc le
+seuil par frame doit être bien plus permissif pour ne rater aucun clip. Comme le firmware décide
+en temps réel **par buffer** (jamais par clip agrégé), c'est la courbe précision-rappel
+**au niveau frame** qui doit servir à calibrer `TRIGGER_LOGIT_THRESHOLD` (`main.c`) - utiliser le
+seuil clip-level donnerait un déclenchement bien plus strict que prévu.
+
+---
+
+## 14. Mode d'enregistrement déclenché (`TRIGGERED_RECORDING_MODE`)
+
+Un troisième mode firmware (mutuellement exclusif avec `STFT_DEBUG_MODE`, `main.c`) : écoute en
+continu, fait tourner le classifieur à chaque buffer de 64ms via le pipeline partagé
+(`computeSpectrogram()`, factorisé pour être réutilisé par les deux modes de debug), et dès que
+le logit dépasse `TRIGGER_LOGIT_THRESHOLD`, ouvre un nouveau fichier WAV - avec ~0.75s de
+pre-roll (anneau circulaire des derniers buffers, toujours mis à jour, indépendamment de l'état
+de déclenchement), reste ouvert tant que le modèle re-déclenche (fenêtre glissante de 5s,
+réinitialisée à chaque re-déclenchement), et se ferme une fois le décompte écoulé - un fichier
+distinct par événement de détection, contrairement au mécanisme de seuil d'amplitude déjà
+présent dans le firmware normal (`makeRecording()`), qui ne garde jamais qu'un seul fichier
+continu avec des trous compressés.
+
+Architecture : un anneau de pre-roll (audio brut, toujours écrit) + une file d'attente
+producteur (ISR)/consommateur (boucle principale) d'enregistrements étiquetés par événement
+(`TRIGGER_EVENT_START/CONTINUE/END`) - même patron que `stftRecordQueue` du mode debug, adapté
+pour porter de l'audio réel plutôt que des données de diagnostic. Une LED verte fixe (pas
+clignotante, contrairement aux flashs d'activité habituels du firmware) reste allumée tant qu'un
+fichier est ouvert.
+
+Deux bugs réels trouvés au premier vrai test sur device, tous deux dans la configuration du
+microphone (copiée telle quelle de `runSTFTFeasibilityTest()`, un outil de test jamais pensé
+pour produire de vrais enregistrements écoutables) :
+
+- **Gain fixe.** `AudioMoth_enableMicrophone(AM_NORMAL_GAIN_RANGE, AM_GAIN_MEDIUM, ...)` ignorait
+  totalement le gain réellement configuré par l'utilisateur (`configSettings->gain`,
+  `enableLowGainRange`) - tout déploiement configuré au-dessus de "medium" sonnait plus
+  faiblement que prévu. Corrigé en lisant `configSettings->gain`/`enableLowGainRange`, comme le
+  fait `makeRecording()` - `clockDivider`/`acquisitionCycles`/`oversampleRate` restent fixés (ils
+  affectent ce que voit le modèle, contrairement au gain, qui n'affecte que le volume).
+- **Facteur d'échelle ×16 manquant, effet bien plus important.** `makeRecording()` n'écrit
+  jamais d'échantillons ADC bruts dans un WAV directement - chaque échantillon passe par
+  `DigitalFilter_applyFilter()`, qui inclut un gain supplémentaire
+  (`sampleMultiplier = 16.0f / (oversampleRate * sampleRateDivider)`) compensant le fait que la
+  lecture ADC brute sans suréchantillonnage matériel (`oversampleRate=1`, celle utilisée ici pour
+  rester fidèle à ce sur quoi le modèle a été entraîné) n'utilise qu'une fraction de la
+  convention pleine échelle int16 standard. `TRIGGERED_RECORDING_MODE` échantillonne directement
+  via DMA sans jamais appeler `DigitalFilter_applyFilter()` - chaque enregistrement était donc
+  ~16x (~24dB) plus faible qu'il n'aurait dû l'être. Corrigé en appliquant ce même facteur
+  (`copyScaledAudioForWav()`) **uniquement** aux copies destinées au fichier WAV - jamais à ce
+  qui nourrit `computeSpectrogram()`/`ModelInference_run()`, dont la calibration dépend de
+  l'échelle ADC brute non modifiée sur laquelle le modèle a été entraîné et validé (voir §10).
+
+Vérification du budget temps réel après ajout de ce mode (même discipline que §11, mesuré sur
+device réel, jamais estimé) : ~59% du budget 64ms au repos, ~71% dans le pire cas (rafale de
+flush du pre-roll au moment d'un déclenchement) - marge confortable, aucune optimisation requise.
+
+---
+
+## 15. Récapitulatif des bugs rencontrés (pour check-list de non-régression)
 
 1. **Dispatcher FFT générique** gonfle la flash de ~75KB (tables jamais utilisées) - corrigé en
    appelant `arm_rfft_fast_init_256_f32()` directement.
@@ -641,8 +802,27 @@ toujours le pipeline entier après chaque changement, pas seulement l'étage mod
    silencieuse de la table de vecteurs d'interruption comme "biais". Corrigé en calculant et
    exportant `input_effective_bias` (et un tableau de zéros pour `hidden_effective_bias`).
    Impact mesuré : corrélation device/PC 0.317 -> 0.9999, écart moyen 0.474 -> 0.0012.
+10. **CNN continu vs relancé par buffer à l'entraînement (bug majeur, §13.1)** - `frame_logits()`
+    et les deux réimplémentations d'`export_int8.py` calculaient le CNN en continu sur tout un
+    clip, donnant un champ réceptif que le firmware n'a jamais en réalité. Corrigé en relançant
+    le CNN par buffer partout, avec un test de cohérence entre les implémentations qui n'existait
+    pas avant.
+11. **Constante de temps de l'EMA RMS dérivée de `CLIP_SECONDS` (§13.2)** - aurait silencieusement
+    désynchronisé l'entraînement du comportement réel du firmware dès qu'on change la durée des
+    clips d'entraînement. Corrigée en la fixant à la constante réelle du firmware (46.875
+    buffers), indépendamment de `CLIP_SECONDS`.
+12. **`TRIGGERED_RECORDING_MODE` : gain microphone fixe (§14)** - `AM_GAIN_MEDIUM` codé en dur au
+    lieu de `configSettings->gain`, copié d'un outil de test jamais pensé pour produire de vrais
+    enregistrements.
+13. **`TRIGGERED_RECORDING_MODE` : facteur d'échelle ×16 manquant sur l'audio WAV (§14)** -
+    l'ADC en lecture brute (`oversampleRate=1`) produit des échantillons ~16x plus petits que la
+    convention pleine échelle habituelle ; le firmware normal compense via
+    `DigitalFilter_applyFilter()`, que ce mode ne traverse jamais. Corrigé en appliquant ce
+    facteur uniquement sur les copies destinées au WAV, jamais sur ce qui nourrit le modèle.
 
-**Test de non-régression le plus utile en cas de doute** : relancer
-`compare_device_output.py` sur une capture fraîche - un écart device/PC qui redevient grand
-et/ou faiblement corrélé signale presque toujours un de ces neuf bugs (ou un nouveau du même
-genre) réapparu.
+**Test de non-régression le plus utile en cas de doute** : pour les bugs 1-9 (parité numérique
+device-vs-PC), relancer `compare_device_output.py` sur une capture fraîche - un écart device/PC
+qui redevient grand et/ou faiblement corrélé signale presque toujours l'un d'eux réapparu. Pour
+les bugs 10-11 (parité entraînement/déploiement), vérifier que `model.frame_logits(spec)` et
+`float_forward_with_traces(spec, folded, model)["logits"]` concordent toujours (§13.1), et que
+`dataset.RMS_EMA_ALPHA` ne change jamais quand `CLIP_SECONDS` change (§13.2).
