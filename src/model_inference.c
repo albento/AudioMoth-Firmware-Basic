@@ -3,10 +3,18 @@
  * openacousticdevices.info
  *
  * Runs the TinyLSTMCNN classifier exported by test-audiomoth-cnn/export_int8.py
- * (model/model_int8_lstm_small_16_focal.{h,c}) on one buffer's spectrogram at a time,
- * via real CMSIS-NN int8 kernels - the on-device counterpart of int8_sim.py, which this
- * mirrors stage for stage. Tied to this specific export (its exact layer shapes/symbol
- * names are hard-coded below), not a generic model loader.
+ * (model/model.{h,c}) on one buffer's spectrogram at a time, via real CMSIS-NN int8 kernels -
+ * the on-device counterpart of int8_sim.py, which this mirrors stage for stage.
+ *
+ * Tied to one fixed architecture (5 conv stages + single-layer LSTM + linear classifier,
+ * channels/hidden_size as exported into model.h's #defines below) - its exact layer shapes
+ * and every symbol name are hard-coded below, not a generic model loader. Swapping in a
+ * differently-trained checkpoint of that SAME architecture (a new test-audiomoth-cnn --tag)
+ * is a drop-in replacement: re-run export_int8.py (always writes model.h/model.c, regardless
+ * of --tag - see its own docstring) and copy the two files over these, no edits needed here.
+ * A genuinely different architecture (extra/removed stages, different channel counts, a
+ * changed gate structure) would still need this file's hardcoded shapes/logic updated to
+ * match, the same as before.
  *****************************************************************************/
 
 #include <string.h>
@@ -16,7 +24,7 @@
 
 #include "audiomoth.h"
 #include "model_inference.h"
-#include "model_int8_lstm_small_16_focal.h"
+#include "model.h"
 
 /* Spatial (frequency x time) dimensions after each stage, hand-computed from the fixed
    input size (129 x 7) and each stage's own kernel/stride/padding (matches
@@ -64,7 +72,7 @@ static int8_t *activationBufferB = (int8_t*)(AM_EXTERNAL_SRAM_START_ADDRESS + AC
 
 static int8_t inputBuffer[MODEL_INFERENCE_INPUT_BINS * MODEL_INFERENCE_INPUT_FRAMES];
 
-static int8_t pooledBuffer[MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_SIZE];
+static int8_t pooledBuffer[MODEL_INPUT_SIZE];
 
 /* Scratch buffer shared by runConv()'s arm_convolve_s8 calls (stage1_pw/stage2_pw) and
    runDepthwiseConv()'s arm_depthwise_conv_s8_opt call (stage1_dw/stage2_dw) - stage0 is
@@ -79,9 +87,9 @@ static int16_t convScratchBuffer[288];
    cell_state/hidden_state persist across calls for real streaming (state carried from one
    64ms buffer to the next, never reset mid-recording). */
 
-static int16_t lstmTemp1[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE];
-static int16_t lstmTemp2[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE];
-static int16_t lstmCellState[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE];
+static int16_t lstmTemp1[MODEL_HIDDEN_SIZE];
+static int16_t lstmTemp2[MODEL_HIDDEN_SIZE];
+static int16_t lstmCellState[MODEL_HIDDEN_SIZE];
 
 /* arm_nn_lstm_calculate_gate_s8_s16() (the function arm_nn_lstm_step_s8() actually calls
    per gate) never reads cmsis_nn_lstm_gate's own `bias` field at all - only
@@ -96,8 +104,8 @@ static int16_t lstmCellState[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE];
    input_effective_bias; hidden_effective_bias is always zero (the bias is added exactly
    once, during the input-weights pass only) - this array is shared by all four gates. */
 
-static const int32_t lstmZeroEffectiveBias[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE] = {0};
-static int8_t lstmHiddenState[MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE];
+static const int32_t lstmZeroEffectiveBias[MODEL_HIDDEN_SIZE] = {0};
+static int8_t lstmHiddenState[MODEL_HIDDEN_SIZE];
 
 void ModelInference_reset(void) {
 
@@ -121,15 +129,15 @@ void ModelInference_reset(void) {
 
 static void runStage0Conv(const int8_t *input, int8_t *output) {
 
-    const int8_t *weight = model_int8_lstm_small_16_focal_stage0_weight;
-    const int32_t *bias = model_int8_lstm_small_16_focal_stage0_bias;
-    const int32_t *multiplier = model_int8_lstm_small_16_focal_stage0_multiplier;
-    const int32_t *shift = model_int8_lstm_small_16_focal_stage0_shift;
+    const int8_t *weight = model_stage0_weight;
+    const int32_t *bias = model_stage0_bias;
+    const int32_t *multiplier = model_stage0_multiplier;
+    const int32_t *shift = model_stage0_shift;
 
-    const int32_t kernel = MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_KERNEL;
-    const int32_t stride = MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_STRIDE;
-    const int32_t padding = MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_PADDING;
-    const int32_t outCh = MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE0_OUT_CH;
+    const int32_t kernel = MODEL_STAGE0_KERNEL;
+    const int32_t stride = MODEL_STAGE0_STRIDE;
+    const int32_t padding = MODEL_STAGE0_PADDING;
+    const int32_t outCh = MODEL_STAGE0_OUT_CH;
 
     int32_t oh, ow, oc, ky, kx;
 
@@ -319,7 +327,7 @@ static void quantizeInput(const float spectrogram[MODEL_INFERENCE_INPUT_FRAMES][
 
         for (frame = 0; frame < MODEL_INFERENCE_INPUT_FRAMES; frame += 1) {
 
-            float value = spectrogram[frame][bin] / MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_SCALE;
+            float value = spectrogram[frame][bin] / MODEL_INPUT_SCALE;
 
             if (value > 127.0f) value = 127.0f;
             if (value < -128.0f) value = -128.0f;
@@ -339,63 +347,63 @@ static void runLSTMStep(void) {
     params.time_major = 0;
     params.batch_size = 1;
     params.time_steps = 1;
-    params.input_size = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_SIZE;
-    params.hidden_size = MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE;
+    params.input_size = MODEL_INPUT_SIZE;
+    params.hidden_size = MODEL_HIDDEN_SIZE;
     params.input_offset = 0;
 
-    params.forget_to_cell_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_TO_CELL_MULTIPLIER;
-    params.forget_to_cell_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_TO_CELL_SHIFT;
-    params.input_to_cell_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_TO_CELL_MULTIPLIER;
-    params.input_to_cell_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_TO_CELL_SHIFT;
+    params.forget_to_cell_multiplier = MODEL_FORGET_TO_CELL_MULTIPLIER;
+    params.forget_to_cell_shift = MODEL_FORGET_TO_CELL_SHIFT;
+    params.input_to_cell_multiplier = MODEL_INPUT_TO_CELL_MULTIPLIER;
+    params.input_to_cell_shift = MODEL_INPUT_TO_CELL_SHIFT;
     params.cell_clip = 32767;
-    params.cell_scale_power = MODEL_INT8_LSTM_SMALL_16_FOCAL_CELL_SCALE_POWER;
+    params.cell_scale_power = MODEL_CELL_SCALE_POWER;
 
-    params.output_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_MULTIPLIER;
-    params.output_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_SHIFT;
+    params.output_multiplier = MODEL_OUTPUT_MULTIPLIER;
+    params.output_shift = MODEL_OUTPUT_SHIFT;
     params.output_offset = 0;
 
-    params.forget_gate.input_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_GATE_INPUT_MULTIPLIER;
-    params.forget_gate.input_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_GATE_INPUT_SHIFT;
-    params.forget_gate.input_weights = model_int8_lstm_small_16_focal_forget_gate_input_weight;
-    params.forget_gate.input_effective_bias = model_int8_lstm_small_16_focal_forget_gate_input_effective_bias;
-    params.forget_gate.hidden_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_GATE_HIDDEN_MULTIPLIER;
-    params.forget_gate.hidden_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_FORGET_GATE_HIDDEN_SHIFT;
-    params.forget_gate.hidden_weights = model_int8_lstm_small_16_focal_forget_gate_hidden_weight;
+    params.forget_gate.input_multiplier = MODEL_FORGET_GATE_INPUT_MULTIPLIER;
+    params.forget_gate.input_shift = MODEL_FORGET_GATE_INPUT_SHIFT;
+    params.forget_gate.input_weights = model_forget_gate_input_weight;
+    params.forget_gate.input_effective_bias = model_forget_gate_input_effective_bias;
+    params.forget_gate.hidden_multiplier = MODEL_FORGET_GATE_HIDDEN_MULTIPLIER;
+    params.forget_gate.hidden_shift = MODEL_FORGET_GATE_HIDDEN_SHIFT;
+    params.forget_gate.hidden_weights = model_forget_gate_hidden_weight;
     params.forget_gate.hidden_effective_bias = lstmZeroEffectiveBias;
-    params.forget_gate.bias = model_int8_lstm_small_16_focal_forget_gate_bias_q3_12;
+    params.forget_gate.bias = model_forget_gate_bias_q3_12;
     params.forget_gate.activation_type = ARM_SIGMOID;
 
-    params.input_gate.input_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_GATE_INPUT_MULTIPLIER;
-    params.input_gate.input_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_GATE_INPUT_SHIFT;
-    params.input_gate.input_weights = model_int8_lstm_small_16_focal_input_gate_input_weight;
-    params.input_gate.input_effective_bias = model_int8_lstm_small_16_focal_input_gate_input_effective_bias;
-    params.input_gate.hidden_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_GATE_HIDDEN_MULTIPLIER;
-    params.input_gate.hidden_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_INPUT_GATE_HIDDEN_SHIFT;
-    params.input_gate.hidden_weights = model_int8_lstm_small_16_focal_input_gate_hidden_weight;
+    params.input_gate.input_multiplier = MODEL_INPUT_GATE_INPUT_MULTIPLIER;
+    params.input_gate.input_shift = MODEL_INPUT_GATE_INPUT_SHIFT;
+    params.input_gate.input_weights = model_input_gate_input_weight;
+    params.input_gate.input_effective_bias = model_input_gate_input_effective_bias;
+    params.input_gate.hidden_multiplier = MODEL_INPUT_GATE_HIDDEN_MULTIPLIER;
+    params.input_gate.hidden_shift = MODEL_INPUT_GATE_HIDDEN_SHIFT;
+    params.input_gate.hidden_weights = model_input_gate_hidden_weight;
     params.input_gate.hidden_effective_bias = lstmZeroEffectiveBias;
-    params.input_gate.bias = model_int8_lstm_small_16_focal_input_gate_bias_q3_12;
+    params.input_gate.bias = model_input_gate_bias_q3_12;
     params.input_gate.activation_type = ARM_SIGMOID;
 
-    params.cell_gate.input_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_CELL_GATE_INPUT_MULTIPLIER;
-    params.cell_gate.input_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_CELL_GATE_INPUT_SHIFT;
-    params.cell_gate.input_weights = model_int8_lstm_small_16_focal_cell_gate_input_weight;
-    params.cell_gate.input_effective_bias = model_int8_lstm_small_16_focal_cell_gate_input_effective_bias;
-    params.cell_gate.hidden_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_CELL_GATE_HIDDEN_MULTIPLIER;
-    params.cell_gate.hidden_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_CELL_GATE_HIDDEN_SHIFT;
-    params.cell_gate.hidden_weights = model_int8_lstm_small_16_focal_cell_gate_hidden_weight;
+    params.cell_gate.input_multiplier = MODEL_CELL_GATE_INPUT_MULTIPLIER;
+    params.cell_gate.input_shift = MODEL_CELL_GATE_INPUT_SHIFT;
+    params.cell_gate.input_weights = model_cell_gate_input_weight;
+    params.cell_gate.input_effective_bias = model_cell_gate_input_effective_bias;
+    params.cell_gate.hidden_multiplier = MODEL_CELL_GATE_HIDDEN_MULTIPLIER;
+    params.cell_gate.hidden_shift = MODEL_CELL_GATE_HIDDEN_SHIFT;
+    params.cell_gate.hidden_weights = model_cell_gate_hidden_weight;
     params.cell_gate.hidden_effective_bias = lstmZeroEffectiveBias;
-    params.cell_gate.bias = model_int8_lstm_small_16_focal_cell_gate_bias_q3_12;
+    params.cell_gate.bias = model_cell_gate_bias_q3_12;
     params.cell_gate.activation_type = ARM_TANH;
 
-    params.output_gate.input_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_GATE_INPUT_MULTIPLIER;
-    params.output_gate.input_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_GATE_INPUT_SHIFT;
-    params.output_gate.input_weights = model_int8_lstm_small_16_focal_output_gate_input_weight;
-    params.output_gate.input_effective_bias = model_int8_lstm_small_16_focal_output_gate_input_effective_bias;
-    params.output_gate.hidden_multiplier = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_GATE_HIDDEN_MULTIPLIER;
-    params.output_gate.hidden_shift = MODEL_INT8_LSTM_SMALL_16_FOCAL_OUTPUT_GATE_HIDDEN_SHIFT;
-    params.output_gate.hidden_weights = model_int8_lstm_small_16_focal_output_gate_hidden_weight;
+    params.output_gate.input_multiplier = MODEL_OUTPUT_GATE_INPUT_MULTIPLIER;
+    params.output_gate.input_shift = MODEL_OUTPUT_GATE_INPUT_SHIFT;
+    params.output_gate.input_weights = model_output_gate_input_weight;
+    params.output_gate.input_effective_bias = model_output_gate_input_effective_bias;
+    params.output_gate.hidden_multiplier = MODEL_OUTPUT_GATE_HIDDEN_MULTIPLIER;
+    params.output_gate.hidden_shift = MODEL_OUTPUT_GATE_HIDDEN_SHIFT;
+    params.output_gate.hidden_weights = model_output_gate_hidden_weight;
     params.output_gate.hidden_effective_bias = lstmZeroEffectiveBias;
-    params.output_gate.bias = model_int8_lstm_small_16_focal_output_gate_bias_q3_12;
+    params.output_gate.bias = model_output_gate_bias_q3_12;
     params.output_gate.activation_type = ARM_SIGMOID;
 
     cmsis_nn_lstm_context buffers;
@@ -409,17 +417,17 @@ static void runLSTMStep(void) {
 
 static float runClassifier(void) {
 
-    int32_t acc = model_int8_lstm_small_16_focal_classifier_bias[0];
+    int32_t acc = model_classifier_bias[0];
 
     uint32_t i;
 
-    for (i = 0; i < MODEL_INT8_LSTM_SMALL_16_FOCAL_HIDDEN_SIZE; i += 1) {
+    for (i = 0; i < MODEL_HIDDEN_SIZE; i += 1) {
 
-        acc += (int32_t)model_int8_lstm_small_16_focal_classifier_weight[i] * (int32_t)lstmHiddenState[i];
+        acc += (int32_t)model_classifier_weight[i] * (int32_t)lstmHiddenState[i];
 
     }
 
-    return (float)acc * MODEL_INT8_LSTM_SMALL_16_FOCAL_CLASSIFIER_LOGIT_SCALE;
+    return (float)acc * MODEL_CLASSIFIER_LOGIT_SCALE;
 
 }
 
@@ -449,34 +457,34 @@ float ModelInference_run(const float spectrogram[MODEL_INFERENCE_INPUT_FRAMES][M
     TIME_STAGE(stage0Microseconds, runStage0Conv(inputBuffer, activationBufferA))
 
     TIME_STAGE(stage1DepthwiseMicroseconds, runDepthwiseConv(activationBufferA, activationBufferB,
-                      model_int8_lstm_small_16_focal_stage1_dw_weight, model_int8_lstm_small_16_focal_stage1_dw_bias,
-                      model_int8_lstm_small_16_focal_stage1_dw_multiplier, model_int8_lstm_small_16_focal_stage1_dw_shift,
-                      MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_DW_IN_CH,
+                      model_stage1_dw_weight, model_stage1_dw_bias,
+                      model_stage1_dw_multiplier, model_stage1_dw_shift,
+                      MODEL_STAGE1_DW_IN_CH,
                       STAGE0_OUT_H, STAGE0_OUT_W, STAGE1_DW_OUT_H, STAGE1_DW_OUT_W,
-                      MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_DW_KERNEL, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_DW_STRIDE,
-                      MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_DW_PADDING))
+                      MODEL_STAGE1_DW_KERNEL, MODEL_STAGE1_DW_STRIDE,
+                      MODEL_STAGE1_DW_PADDING))
 
     TIME_STAGE(stage1PointwiseMicroseconds, runConv(activationBufferB, activationBufferA,
-            model_int8_lstm_small_16_focal_stage1_pw_weight, model_int8_lstm_small_16_focal_stage1_pw_bias,
-            model_int8_lstm_small_16_focal_stage1_pw_multiplier, model_int8_lstm_small_16_focal_stage1_pw_shift,
-            MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_PW_IN_CH, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE1_PW_OUT_CH,
+            model_stage1_pw_weight, model_stage1_pw_bias,
+            model_stage1_pw_multiplier, model_stage1_pw_shift,
+            MODEL_STAGE1_PW_IN_CH, MODEL_STAGE1_PW_OUT_CH,
             STAGE1_PW_OUT_H * STAGE1_PW_OUT_W))
 
     TIME_STAGE(stage2DepthwiseMicroseconds, runDepthwiseConv(activationBufferA, activationBufferB,
-                      model_int8_lstm_small_16_focal_stage2_dw_weight, model_int8_lstm_small_16_focal_stage2_dw_bias,
-                      model_int8_lstm_small_16_focal_stage2_dw_multiplier, model_int8_lstm_small_16_focal_stage2_dw_shift,
-                      MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_DW_IN_CH,
+                      model_stage2_dw_weight, model_stage2_dw_bias,
+                      model_stage2_dw_multiplier, model_stage2_dw_shift,
+                      MODEL_STAGE2_DW_IN_CH,
                       STAGE1_PW_OUT_H, STAGE1_PW_OUT_W, STAGE2_DW_OUT_H, STAGE2_DW_OUT_W,
-                      MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_DW_KERNEL, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_DW_STRIDE,
-                      MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_DW_PADDING))
+                      MODEL_STAGE2_DW_KERNEL, MODEL_STAGE2_DW_STRIDE,
+                      MODEL_STAGE2_DW_PADDING))
 
     TIME_STAGE(stage2PointwiseMicroseconds, runConv(activationBufferB, activationBufferA,
-            model_int8_lstm_small_16_focal_stage2_pw_weight, model_int8_lstm_small_16_focal_stage2_pw_bias,
-            model_int8_lstm_small_16_focal_stage2_pw_multiplier, model_int8_lstm_small_16_focal_stage2_pw_shift,
-            MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_PW_IN_CH, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_PW_OUT_CH,
+            model_stage2_pw_weight, model_stage2_pw_bias,
+            model_stage2_pw_multiplier, model_stage2_pw_shift,
+            MODEL_STAGE2_PW_IN_CH, MODEL_STAGE2_PW_OUT_CH,
             STAGE2_PW_OUT_H * STAGE2_PW_OUT_W))
 
-    TIME_STAGE(avgPoolMicroseconds, runAvgPoolFreq(activationBufferA, pooledBuffer, MODEL_INT8_LSTM_SMALL_16_FOCAL_STAGE2_PW_OUT_CH,
+    TIME_STAGE(avgPoolMicroseconds, runAvgPoolFreq(activationBufferA, pooledBuffer, MODEL_STAGE2_PW_OUT_CH,
                    STAGE2_PW_OUT_H, STAGE2_PW_OUT_W))
 
     TIME_STAGE(lstmMicroseconds, runLSTMStep())

@@ -17,28 +17,46 @@
 #include "audioconfig.h"
 #include "digitalfilter.h"
 #include "model_inference.h"
+#include "pcen.h"
 
 /* STFT feasibility debug mode - set to 0 to restore normal recording firmware. Mutually
    exclusive with TRIGGERED_RECORDING_MODE below - only one of the two may be 1 at a time
    (see the #error guard just below). */
 
-#define STFT_DEBUG_MODE                          0
+#define STFT_DEBUG_MODE                          1
 
 /* Continuously listens and runs the on-device INT8 classifier (model_inference.c) every
-   64ms buffer; whenever its output crosses TRIGGER_LOGIT_THRESHOLD, records a new WAV file
-   (with ~TRIGGER_PREROLL_SECONDS of pre-roll audio), keeping it open while re-triggered
+   64ms buffer; whenever its output crosses TRIGGER_PROBABILITY_THRESHOLD, records a new WAV
+   file (with ~TRIGGER_PREROLL_SECONDS of pre-roll audio), keeping it open while re-triggered
    (sliding TRIGGER_TAIL_SECONDS countdown) and closing it once the countdown lapses - see
    runTriggeredRecording(). See GUIDE_REIMPLEMENTATION.md for the STFT/model pipeline this
    reuses, and the plan this was built from for the full design rationale. */
 
-#define TRIGGERED_RECORDING_MODE                 1
+#define TRIGGERED_RECORDING_MODE                 0
 
 #if STFT_DEBUG_MODE && TRIGGERED_RECORDING_MODE
 #error "STFT_DEBUG_MODE and TRIGGERED_RECORDING_MODE are mutually exclusive - set at most one to 1"
 #endif
 
+/* Only meaningful alongside STFT_DEBUG_MODE=1 (compiles to nothing otherwise) - runs an
+   isolated, dummy-weight ALiBi windowed-attention encoder layer (see attnRunLayer() further
+   below) once per raw STFT frame, purely to get a real hardware timing number for whether a
+   ViT could plausibly run in real time here - NOT a step towards actually deploying it: no
+   trained/exported ViT weights exist, model_inference.c/model.h/the LSTM classifier are
+   completely untouched by this, in this mode and every other. See
+   test-audiomoth-cnn/student_model.py's _AlibiEncoderLayer/_AlibiSelfAttention for the
+   reference this ports, and this section's own comment further below for the full design
+   rationale. */
+
+#define STFT_DEBUG_ATTENTION_TEST                1
+
 #if STFT_DEBUG_MODE || TRIGGERED_RECORDING_MODE
 #include "arm_math.h"
+#endif
+
+#if STFT_DEBUG_MODE && STFT_DEBUG_ATTENTION_TEST
+#include "arm_nnfunctions.h"
+#include "arm_nnsupportfunctions.h"
 #endif
 
 /* Useful time constants */
@@ -2876,16 +2894,64 @@ inline void AudioMoth_handleSwitchInterrupt() {
    STFT_INT16_FULL_SCALE: the firmware's own raw ADC samples are never divided by 32768 (see
    the STFT_LOG_MODE branches below - source[...] is cast straight to float), so this works
    in that same raw scale, not a [-1,1]-normalized one.
-   STFT_RMS_EMA_BUFFERS: 2/(N+1) is the standard convention for "this exponential average
-   behaves like a simple moving average of N samples" - N chosen to match CLIP_SECONDS=3.0s
+   STFT_RISE_EMA_BUFFERS: 2/(N+1) is the standard convention for "this exponential average
+   behaves like a simple moving average of N samples" - kept at the original ~3s time constant
    (MAXIMUM_SAMPLES_IN_DMA_TRANSFER=1024 samples per buffer @ 16kHz = 64ms/buffer,
-   3.0s/0.064s = 46.875 buffers) - not empirically tuned, must stay equal to dataset.py's
-   RMS_EMA_BUFFERS if that ever changes. */
+   46.875 buffers = 3.0s) - not empirically tuned, must stay equal to dataset.py's
+   RISE_EMA_BUFFERS if that ever changes.
+
+   Dual time constant: slow to rise, fast to fall - the OPPOSITE asymmetry from a classic
+   peak-limiting AGC (fast attack/slow release). This normalizer levels speech for detection,
+   not peak-limits for clipping protection: a fast rise would react to the detected speech
+   itself (which elevates bufferMeanSq), dragging the gain down while the speech is playing
+   and self-suppressing the very signal the model needs to see; a slow fall leaves the gain
+   suppressed for ~3s after a loud event ends, hurting detection of whatever quiet/normal
+   content follows immediately after - a failure mode observed on real recordings.
+
+   STFT_FALL_EMA_BUFFERS was originally 8 (~0.5s), validated only against a synthetic loud-
+   burst-then-quiet step function. On real audio (continuously fluctuating, not a step
+   function), "quieter than the running estimate" is true on ~57% of buffers, not just "just
+   after a loud event ended" - at 8 buffers that fired large gain swings on more than a
+   quarter of all buffers (>10% buffer-to-buffer change), an AGC "pumping" artifact riding
+   the signal's natural envelope far more aggressively than intended, plausibly washing out
+   amplitude-contrast cues the model relies on (observed as barely-moved frame-level
+   precision@recall>=95% after retraining with this normalizer, and reduced real-world
+   sensitivity even after re-tuning TRIGGER_PROBABILITY_THRESHOLD - see EXPERIMENTS.md). 16
+   buffers (~1s) cuts buffers with a >10% gain jump from ~27% to ~5% on real audio while
+   still recovering to ~90% of target within ~1.9s of a loud event ending - not a proven-
+   optimal value, but a meaningfully less pumpy one. Must stay equal to dataset.py's
+   RISE_EMA_BUFFERS/FALL_EMA_BUFFERS if either ever changes. */
+
+/* Mirrors test-audiomoth-cnn/config.yaml's audio.normalization - "ema" (below), "none" (no
+   gain applied at all, raw ADC samples straight into the STFT - a baseline to check whether
+   normalizing loudness helps at all, now that the dataset itself already varies volume via
+   real per-segment SNR), or "pcen" (Per-Channel Energy Normalization, Wang et al. 2017 - an
+   adaptive gain computed independently per frequency bin, on the spectrogram itself, AFTER
+   the FFT, instead of one global gain applied to the waveform BEFORE it - see
+   test-audiomoth-cnn/student_model.py's LearnablePCEN and this file's own stftFastPow/
+   computeSpectrogram below). Compile-time, not runtime-configurable - same pattern as
+   STFT_DEBUG_MODE/TRIGGERED_RECORDING_MODE above.
+
+   PCEN's own per-band alpha/delta/r/ema_alpha are NOT compile-time constants shared across
+   every checkpoint the way STFT_RISE_EMA_ALPHA etc. are - they're LEARNED per band by a given
+   training run (see LearnablePCEN) and baked into model/pcen.h/pcen.c by
+   test-audiomoth-cnn/export_pcen.py, the same "regenerate, don't hand-edit, copy alongside
+   model.h/model.c" convention model.h/model.c already use. A pcen.h/pcen.c mismatched to the
+   model.h/model.c it's paired with (e.g. from two different checkpoints) is a silent
+   train/inference skew, exactly like mismatched STFT constants would be. */
+
+#define STFT_NORMALIZATION_EMA                    0
+#define STFT_NORMALIZATION_NONE                   1
+#define STFT_NORMALIZATION_PCEN                   2
+
+#define STFT_NORMALIZATION_MODE                   STFT_NORMALIZATION_PCEN
 
 #define STFT_TARGET_RMS                           0.1f
 #define STFT_INT16_FULL_SCALE                     32768.0f
-#define STFT_RMS_EMA_BUFFERS                      46.875f
-#define STFT_RMS_EMA_ALPHA                        (2.0f / (STFT_RMS_EMA_BUFFERS + 1.0f))
+#define STFT_RISE_EMA_BUFFERS                     46.875f
+#define STFT_FALL_EMA_BUFFERS                     16.0f
+#define STFT_RISE_EMA_ALPHA                       (2.0f / (STFT_RISE_EMA_BUFFERS + 1.0f))
+#define STFT_FALL_EMA_ALPHA                       (2.0f / (STFT_FALL_EMA_BUFFERS + 1.0f))
 
 #define STFT_TWO_PI                               6.28318530717958647692f
 
@@ -2933,11 +2999,17 @@ inline void AudioMoth_handleSwitchInterrupt() {
 
 #endif
 
-#if STFT_LOG_MODE == STFT_LOG_MODE_LOG10_FIXED
+#if STFT_LOG_MODE == STFT_LOG_MODE_LOG10_FIXED || STFT_NORMALIZATION_MODE == STFT_NORMALIZATION_PCEN
 
 /* Fast log10 approximation with no floating point operations beyond reinterpreting the input's bit pattern and converting the final fixed-point result back to a float for storage. Based on the classic IEEE-754 bit-hack: for a positive float32 x, its raw bit pattern i satisfies log2(x) ~= i / 2^23 - 127. Since (i / 2^23) * 2^16 == i >> 7, that gives log2(x) in Q16.16 fixed point (value = integer / 65536) using only a shift and a subtract - no multiplication or division. log10 is then obtained with a single Q16.16 fixed-point multiply by log10(2), instead of the more expensive libm log10f().
 
-   The naive bias of 127 is exact only at powers of two and otherwise always undershoots (the true log2(1+m) curve for mantissa m in [0,1) is concave, so the linear m approximation stays below it), with a worst case of 0.0861 (in log2 units) at m = 1/ln(2) - 1. Using a bias of 127 - 0.0430356660279671 = 126.95696433397204 instead re-centres that error around zero, halving the worst case to 0.0430 - equivalent to roughly 0.26dB instead of 0.52dB on the final 20*log10 result, for no extra cost since it's still a single constant. */
+   The naive bias of 127 is exact only at powers of two and otherwise always undershoots (the true log2(1+m) curve for mantissa m in [0,1) is concave, so the linear m approximation stays below it), with a worst case of 0.0861 (in log2 units) at m = 1/ln(2) - 1. Using a bias of 127 - 0.0430356660279671 = 126.95696433397204 instead re-centres that error around zero, halving the worst case to 0.0430 - equivalent to roughly 0.26dB instead of 0.52dB on the final 20*log10 result, for no extra cost since it's still a single constant.
+
+   Guarded on STFT_NORMALIZATION_PCEN too (not just STFT_LOG_MODE_LOG10_FIXED): stftFastPow()
+   below (PCEN's own fractional-exponent pow) reuses stftFastLog2Q16_16() directly, regardless
+   of which STFT_LOG_MODE is selected - STFT_LOG_MODE only chooses between log10 variants for
+   the EMA/NONE dB path, which STFT_NORMALIZATION_PCEN bypasses entirely (see
+   computeSpectrogram() below), so the two macros are genuinely independent here. */
 
 #define STFT_LOG2_BIAS_Q16_16                    8320252  /* round(126.95696433397204 * 65536) */
 
@@ -2951,6 +3023,8 @@ static inline int32_t stftFastLog2Q16_16(float32_t x) {
 
 }
 
+#if STFT_LOG_MODE == STFT_LOG_MODE_LOG10_FIXED
+
 static inline float32_t stftFastLog10(float32_t x) {
 
     int32_t log2Fixed = stftFastLog2Q16_16(x);
@@ -2960,6 +3034,54 @@ static inline float32_t stftFastLog10(float32_t x) {
     return (float32_t)log10Fixed / 65536.0f;
 
 }
+
+#endif
+
+#if STFT_NORMALIZATION_MODE == STFT_NORMALIZATION_PCEN
+
+/* Fast x^a approximation for PCEN's own fractional, per-band-LEARNED exponents (alpha, r -
+   see model/pcen.h) - stftFastLog10 above can't be reused for these the way it's reused for
+   the EMA/NONE dB path, since that has one FIXED exponent (always base-10) baked into a single
+   shared constant (STFT_LOG2_TO_LOG10_Q16_16), while PCEN needs a different exponent per bin,
+   decided by training, not known at compile time.
+
+   pow(x, a) = exp2(a * log2(x)): reuses stftFastLog2Q16_16()'s exact approximation (and its
+   same bias) to get log2(x), scales by the exponent, then reconstructs a float from the
+   scaled Q16.16 value via the SAME bit trick in reverse (bits = (log2Fixed + BIAS) << 7,
+   i.e. algebraically undoing stftFastLog2Q16_16's own (i >> 7) - BIAS) - not a new/unproven
+   numerical scheme, the exact same approximation quality already validated and deployed for
+   stftFastLog10 (~0.26dB / ~3% worst case on a single log10 call). End-to-end (both pow()
+   calls PCEN actually makes, compounded, against exact float64 PCEN on a real recording -
+   see test-audiomoth-cnn's fast-PCEN validation): mean absolute error 0.05, p99 0.13, against
+   PCEN's own ~0-14 output range - the approximation error is a small fraction of PCEN's own
+   dynamic range, not a dominant source of noise. x must be > 0 (a genuine bit-pattern
+   assumption of the trick, same precondition stftFastLog2Q16_16 already has) - every call site
+   below adds a small positive floor before calling this, same convention as STFT_LOG_EPSILON
+   in the dB path. */
+
+static inline float32_t stftFastExp2Q16_16(int32_t log2Fixed) {
+
+    int32_t i = (log2Fixed + STFT_LOG2_BIAS_Q16_16) << 7;
+
+    float32_t result;
+
+    memcpy(&result, &i, sizeof(i));
+
+    return result;
+
+}
+
+static inline float32_t stftFastPow(float32_t x, float32_t a) {
+
+    int32_t log2Fixed = stftFastLog2Q16_16(x);
+
+    int32_t scaledLog2Fixed = (int32_t)((float32_t)log2Fixed * a);
+
+    return stftFastExp2Q16_16(scaledLog2Fixed);
+
+}
+
+#endif
 
 #endif
 
@@ -3003,6 +3125,20 @@ typedef struct {
     uint32_t elapsedMicroseconds;
     uint32_t inferenceMicroseconds;
     ModelInferenceTiming_t modelTiming;
+#if STFT_DEBUG_ATTENTION_TEST
+    uint32_t attentionMicroseconds;
+    /* Per-sub-stage breakdown - see AttnLayerTiming_t/ATTN_TIME_STAGE further below (defined
+       after this struct, hence plain uint32_t fields here rather than embedding that type
+       directly - this file's own STFT_NORMALIZATION_MODE/model-inference sections are
+       similarly forward-referenced by name only where needed, not reordered, so keeping this
+       consistent rather than moving AttnLayerTiming_t's definition up here instead). */
+    uint32_t attnQkvMicroseconds;
+    uint32_t attnCoreMicroseconds;
+    uint32_t attnOutProjMicroseconds;
+    uint32_t attnLayerNorm1Microseconds;
+    uint32_t attnFfnMicroseconds;
+    uint32_t attnLayerNorm2Microseconds;
+#endif
 } stftRecord_t;
 
 #endif
@@ -3049,13 +3185,35 @@ static volatile uint32_t stftBufferCounter;
 
 #endif
 
+#if STFT_NORMALIZATION_MODE == STFT_NORMALIZATION_EMA
+
 /* Persistent streaming RMS estimate (mean-square power, raw ADC scale) - see
-   STFT_RMS_EMA_ALPHA's comment above. Reset once per recording (resetRMSNormalization(),
+   STFT_RISE_EMA_ALPHA/STFT_FALL_EMA_ALPHA's comment above. Reset once per recording (resetRMSNormalization(),
    called from runSTFTFeasibilityTest() or runTriggeredRecording() alongside
    ModelInference_reset()), then updated once
    per buffer by computeBufferGain() below - never reset mid-recording. */
 
 static float stftRunningMeanSq;
+
+#endif
+
+#if STFT_NORMALIZATION_MODE == STFT_NORMALIZATION_PCEN
+
+/* Persistent PER-BAND running power estimate (PCEN's own "M", see model/pcen.h's
+   model_pcen_ema_alpha and computeSpectrogram() below) - the PCEN equivalent of
+   stftRunningMeanSq above, one value per frequency bin instead of a single global scalar,
+   since PCEN's whole point is that a bin's own recent history can differ from the buffer's
+   overall mean-square (see main.c's STFT_NORMALIZATION_MODE comment). Reset once per
+   recording (resetRMSNormalization() below), then updated once per FRAME (not per buffer -
+   PCEN runs on the post-FFT per-bin magnitude, at STFT_NUMBER_OF_FRAMES-per-buffer
+   resolution, not the waveform-domain per-buffer resolution stftRunningMeanSq uses) by
+   computeSpectrogram() - never reset mid-recording. */
+
+static float pcenRunningM[STFT_NUMBER_OF_BINS];
+
+#endif
+
+#if STFT_NORMALIZATION_MODE == STFT_NORMALIZATION_EMA
 
 static void resetRMSNormalization(void) {
 
@@ -3087,13 +3245,88 @@ static float computeBufferGain(const int16_t *source) {
 
     float bufferMeanSq = sum / (float)MAXIMUM_SAMPLES_IN_DMA_TRANSFER;
 
-    stftRunningMeanSq = STFT_RMS_EMA_ALPHA * bufferMeanSq + (1.0f - STFT_RMS_EMA_ALPHA) * stftRunningMeanSq;
+    float alpha = (bufferMeanSq > stftRunningMeanSq) ? STFT_RISE_EMA_ALPHA : STFT_FALL_EMA_ALPHA;
+
+    stftRunningMeanSq = alpha * bufferMeanSq + (1.0f - alpha) * stftRunningMeanSq;
 
     return targetRmsRaw / sqrtf(stftRunningMeanSq + 1.0f);
 
 }
 
-/* Computes the RMS-normalized, high-pass-masked log-magnitude STFT of one 64ms buffer into
+#else
+
+/* STFT_NORMALIZATION_NONE and STFT_NORMALIZATION_PCEN both apply no waveform-domain gain at
+   all (compiled out entirely rather than short-circuited, same reasoning as before: also
+   measures/saves the mean-square accumulate loop's own compute cost, not just its effect on
+   the model's input) - PCEN's own per-band adaptation happens AFTER the FFT, on the
+   magnitude, in computeSpectrogram() below, not here. */
+
+static void resetRMSNormalization(void) {
+
+#if STFT_NORMALIZATION_MODE == STFT_NORMALIZATION_PCEN
+
+    for (uint32_t bin = 0; bin < STFT_NUMBER_OF_BINS; bin += 1) {
+
+        pcenRunningM[bin] = model_pcen_initial_m[bin];
+
+    }
+
+#endif
+
+}
+
+static float computeBufferGain(const int16_t *source) {
+
+    (void)source;
+
+    return 1.0f;
+
+}
+
+#endif
+
+#if STFT_NORMALIZATION_MODE == STFT_NORMALIZATION_PCEN
+
+/* One bin's PCEN value for the current frame, updating its persistent pcenRunningM[bin] in
+   place first - matches student_model._pcen()'s per-frame loop body exactly:
+   M[t] = (1-ema_alpha)*M[t-1] + ema_alpha*E[t], output = (E/(M+eps)^alpha + delta)^r - delta^r
+   (E = power = magnitude^2, see model/pcen.h's own docstring for why power not amplitude).
+   Factored out of computeSpectrogram() below since it's called from 3 different places there
+   (bin 0, the Nyquist bin, and the main per-bin loop - see that function's own comment on why
+   those are separate call sites, not merely a stylistic choice) - inlining the same 6-line
+   formula 3 times would risk exactly the kind of copy-paste drift this codebase's "one shared
+   implementation" convention (e.g. run_feature_stack_s8 on the Python side) exists to avoid.
+
+   Never called with magnitude/power == 0 in a way that matters: for the 3 masked bins
+   (bin < STFT_HIGHPASS_BIN), power is always exactly 0, so ratio is always exactly 0 and the
+   result is always exactly delta^r - delta^r == 0 REGARDLESS of pcenRunningM's value - matching
+   every other STFT_LOG_MODE's own masked-bin handling (a fixed, magnitude-independent output),
+   so no bin-range special-casing is needed here, only in the caller's masking of `magnitude`
+   itself (same as every other mode already does). delta[bin] > 0 always (softplus range) keeps
+   `base` (the argument to the final stftFastPow) strictly positive even when ratio is exactly
+   0, satisfying stftFastPow's own x>0 precondition unconditionally - no epsilon-flooring needed
+   here the way STFT_LOG_EPSILON floors the dB path's log argument. */
+
+static inline float32_t computePcenBin(uint32_t bin, float32_t magnitude) {
+
+    float32_t power = magnitude * magnitude;
+
+    pcenRunningM[bin] = model_pcen_ema_alpha[bin] * power + (1.0f - model_pcen_ema_alpha[bin]) * pcenRunningM[bin];
+
+    float32_t denom = stftFastPow(pcenRunningM[bin] + MODEL_PCEN_EPS, model_pcen_alpha[bin]);
+
+    float32_t ratio = power / denom;
+
+    float32_t base = ratio + model_pcen_delta[bin];
+
+    return stftFastPow(base, model_pcen_r[bin]) - model_pcen_delta_pow_r[bin];
+
+}
+
+#endif
+
+/* Computes the RMS-normalized, high-pass-masked log-magnitude (or, in STFT_NORMALIZATION_PCEN,
+   PCEN-compressed) STFT of one 64ms buffer into
    the shared stftSpectrogramDb - shared by STFT_DEBUG_MODE's ISR (timed separately from
    ModelInference_run() there, for the existing per-stage CSV/BINARY output) and
    TRIGGERED_RECORDING_MODE's ISR (which only needs the resulting logit, no per-stage
@@ -3118,7 +3351,32 @@ static void computeSpectrogram(const int16_t *source) {
 
         /* CMSIS-DSP packs the real DC and Nyquist bins into the first complex slot of the output */
 
-#if STFT_LOG_MODE == STFT_LOG_MODE_LOG10F
+#if STFT_NORMALIZATION_MODE == STFT_NORMALIZATION_PCEN
+
+        /* Bypasses STFT_LOG_MODE entirely - PCEN replaces the whole dB conversion, not just
+           one of its variants (matching student_model.py's LogSpectrogram.forward(): in
+           normalization="pcen" mode, self.pcen(magnitude) is returned directly, _fast_log10_db
+           is never called at all). Bin 0 (DC) forced to 0 the same way every other mode forces
+           it to a fixed, magnitude-independent floor - see computePcenBin's own docstring for
+           why that's exactly right for PCEN too, not merely a convenient approximation. */
+
+        stftSpectrogramDb[frame][0] = computePcenBin(0, 0.0f);
+
+        stftSpectrogramDb[frame][STFT_FFT_LENGTH / 2] = computePcenBin(STFT_FFT_LENGTH / 2, fabsf(stftFFTOutput[1]));
+
+        for (uint32_t bin = 1; bin < STFT_FFT_LENGTH / 2; bin += 1) {
+
+            float32_t re = stftFFTOutput[2 * bin];
+
+            float32_t im = stftFFTOutput[2 * bin + 1];
+
+            float32_t magnitude = (bin < STFT_HIGHPASS_BIN) ? 0.0f : sqrtf(re * re + im * im);
+
+            stftSpectrogramDb[frame][bin] = computePcenBin(bin, magnitude);
+
+        }
+
+#elif STFT_LOG_MODE == STFT_LOG_MODE_LOG10F
 
         /* Bin 0 (DC, 0Hz) is always below STFT_HIGHPASS_BIN - masked to the epsilon floor, matching student_model.py's LogSpectrogram exactly (magnitude zeroed before the log, not the log output clamped after) */
 
@@ -3206,6 +3464,491 @@ static void computeSpectrogram(const int16_t *source) {
 
 }
 
+#if STFT_DEBUG_MODE && STFT_DEBUG_ATTENTION_TEST
+
+/* Isolated ALiBi windowed-attention encoder-layer timing test - see this section's own
+   comment on STFT_DEBUG_ATTENTION_TEST above for the full scope/purpose (a compute-cost
+   probe, not a step towards real deployment: dummy weights, dummy input, no real ViT export
+   exists). Ports test-audiomoth-cnn/student_model.py's _AlibiEncoderLayer/
+   _AlibiSelfAttention - one encoder layer; that checkpoint uses depth=2, so double this
+   measurement (plus patch_embed/the classifier, both small relative to a layer - see
+   EXPERIMENTS.md's own parameter breakdown) for a full-model estimate.
+
+   ATTN_EMBED_DIM is deliberately a knob, not hardwired to one checkpoint's shape: the first
+   real measurement (embed_dim=64, n_heads=4, context_size=32, matching
+   student_cnn_vit_alibi_pcen.pt, the best-performing checkpoint at the time) came back at
+   ~209ms for a single layer's worth of buffer, ~3x the entire 64ms budget on its own (see
+   EXPERIMENTS.md) - set to 32 to measure the smaller embed_dim currently being trained
+   (--vit-embed-dim 32) as a candidate for closing that gap. Every other #define below derives
+   from it, so this is the only line that needs to change to compare configurations.
+
+   Symmetric (zero-point-free) INT8 quantization throughout - input_offset/filter_offset/
+   output_offset all 0 - the same convention model_inference.c's own conv/LSTM kernels
+   already use (their own export comments note "input_zero_point is always 0 here"), so this
+   stays consistent with how a real ViT export would eventually look rather than inventing a
+   different convention just for this probe. */
+
+#define ATTN_EMBED_DIM                            32
+
+#define ATTN_N_HEADS                              4
+
+#define ATTN_HEAD_DIM                              (ATTN_EMBED_DIM / ATTN_N_HEADS)
+
+#define ATTN_CONTEXT_SIZE                         32
+
+#define ATTN_FFN_DIM                               (4 * ATTN_EMBED_DIM)
+
+/* The real checkpoint (student_cnn_vit_alibi_pcen.pt) has depth=2, not 1 - the single-layer
+   measurements so far understated the real stacked cost. attnRunLayer() below now takes a
+   layer index so each of the ATTN_N_LAYERS layers gets its own K/V ring buffer (a real 2-layer
+   model's layer 2 attends over layer 2's own history, not layer 1's) - see attnKWindow/
+   attnVWindowT's own comment for why the WEIGHTS are still shared dummy data across layers
+   rather than duplicated: it doesn't change the timing at all (CMSIS-NN/attnVecMatMultS8's
+   execution time depends only on shapes, never on the values read), so duplicating another
+   ~12KB of flash for a second identical-shaped dummy weight set would add flash usage without
+   adding any timing information this probe cares about. */
+
+#define ATTN_N_LAYERS                              2
+
+/* Dummy multiplier/shift shared by every requantizing call below - not calibrated against
+   any real activation range (there is none, see above), just a fixed, bounded scale (~0.5,
+   Q31 convention) that keeps int8 outputs from every stage saturating identically on every
+   call - enough for a compute-cost probe, not remotely enough for a real accuracy claim. */
+
+#define ATTN_DUMMY_MULTIPLIER                     1073741824
+
+#define ATTN_DUMMY_SHIFT                          -1
+
+/* Weights/biases below used to be filled at runtime (attnFillDummyInt8(), a simple
+   deterministic pattern, never trained/exported - see this section's own header comment) into
+   writable arrays living in external SRAM, because non-const arrays can't have compile-time
+   initializers and the ~13KB total (at this ATTN_EMBED_DIM) didn't fit the remaining internal
+   RAM headroom. Third experiment in this series (after idea #1/softmax-batching, idea #2/
+   hand-written dot product, and moving K/V to internal RAM - see that comment above): the
+   qkv/out_proj/FFN stages' own weight reads were the one remaining external-SRAM access this
+   probe hadn't isolated, and a REAL exported ViT would have these as `const` arrays living in
+   FLASH instead, exactly like model.h/pcen.h's own trained weights - flash reads are already
+   proven fast enough for this hardware's real-time budget by the deployed LSTM's own model.c.
+   So: same deterministic values (bit-for-bit, see scripts/gen_attn_dummy_weights.py), but now
+   generated at build time into src/attn_dummy_weights.h as `const` arrays, which the linker
+   places in flash (.rodata) instead of internal RAM or external SRAM - isolating "where do the
+   weights live" as the sole remaining variable versus the previous external-SRAM measurement.
+   #include lives right below; attnQkvWeight etc. now just alias the generated *Const names. */
+
+#include "attn_dummy_weights.h"
+
+#define attnQkvWeight                             attnQkvWeightConst
+#define attnQkvBias                               attnQkvBiasConst
+#define attnOutProjWeight                         attnOutProjWeightConst
+#define attnOutProjBias                           attnOutProjBiasConst
+#define attnLinear1Weight                         attnLinear1WeightConst
+#define attnLinear1Bias                           attnLinear1BiasConst
+#define attnLinear2Weight                         attnLinear2WeightConst
+#define attnLinear2Bias                           attnLinear2BiasConst
+
+/* Per-layer, per-head ring buffers of the last ATTN_CONTEXT_SIZE frames' K/V. K is stored
+   [context][head_dim] (natural layout, matches attnVecMatMultS8's rhs convention for computing
+   Q . K^T); V is stored PRE-TRANSPOSED as [head_dim][context] so the exact same function
+   computes attn . V without needing a second, differently-shaped kernel - see
+   student_model.py's own _AlibiSelfAttention docstring for why V needs this layout on the
+   training side too. Never reset mid-recording, like PCEN's/the LSTM's own persistent state -
+   cold-start correctness at the very start of a recording, before the window has filled once,
+   is out of scope here (see this section's own header comment).
+
+   Layer 0's ring buffer lives in internal RAM (2KB) - the placement confirmed to cut attn_core
+   by ~13% earlier in this session. Layer 1's doesn't also fit: internal RAM had only ~1KB of
+   headroom left with layer 0's buffer already in it (confirmed directly - linking a second
+   2KB buffer there overflowed RAM). So layer 1 falls back to external SRAM, the same tradeoff
+   the WEIGHTS used to have before they moved to flash - this makes layer 1's attn_core
+   somewhat pessimistic relative to layer 0's for this specific 2-layer measurement (by roughly
+   that same ~13%). A real deployment sized for depth=2 would likely need a smaller
+   ATTN_CONTEXT_SIZE or embed_dim to fit both layers' K/V in fast RAM simultaneously - a design
+   tradeoff out of scope for this timing probe. Bare AM_EXTERNAL_SRAM_START_ADDRESS (not an
+   offset like TRIGGER_QUEUE_BASE_OFFSET uses) - safe here because this probe has only ever been
+   measured in CSV output mode, where stftRecordQueue stays in internal RAM and never claims
+   this address (see stftRecordQueue's own STFT_OUTPUT_MODE_BINARY branch above); it would
+   collide if this probe were ever run in BINARY mode instead, not attempted this session. */
+
+static int8_t attnKWindowLayer0[ATTN_N_HEADS][ATTN_CONTEXT_SIZE][ATTN_HEAD_DIM];
+static int8_t attnVWindowTLayer0[ATTN_N_HEADS][ATTN_HEAD_DIM][ATTN_CONTEXT_SIZE];
+
+typedef struct {
+    int8_t kWindow[ATTN_N_HEADS][ATTN_CONTEXT_SIZE][ATTN_HEAD_DIM];
+    int8_t vWindowT[ATTN_N_HEADS][ATTN_HEAD_DIM][ATTN_CONTEXT_SIZE];
+} attnExternalWindow_t;
+
+static attnExternalWindow_t *attnWindowLayer1 = (attnExternalWindow_t*)AM_EXTERNAL_SRAM_START_ADDRESS;
+
+/* Precomputed ALiBi bias, per head/window-offset - see student_model.py's TinyViT._alibi_bias
+   for the reference (fixed geometric slopes, not learned - see _alibi_slopes there, so a real
+   deployment could genuinely precompute this exact table, unlike PCEN's learned constants).
+   Added to the QK^T scores after CMSIS-NN's own requantization (int8 domain) rather than to
+   the pre-requantization int32 accumulator - a deliberate simplification acceptable for a
+   compute-cost probe, same spirit as this whole section's dummy quantization scale. Small
+   (ATTN_N_HEADS x ATTN_CONTEXT_SIZE bytes = 128B) - stays in internal RAM, unlike everything
+   above. */
+
+static int8_t attnAlibiBias[ATTN_N_HEADS][ATTN_CONTEXT_SIZE];
+
+static uint32_t attnWindowPos[ATTN_N_LAYERS];
+
+static bool attnStateInitialised;
+
+/* Weight/bias filling is gone from here - attnQkvWeight etc. are now the const/flash arrays
+   from attn_dummy_weights.h (see that #include above). What's left to initialise at runtime is
+   just the ALiBi table and the K/V ring buffers, neither of which can be const (ALiBi could be,
+   in principle, but is cheap enough to compute once here instead of also generating it; K/V is
+   genuine runtime state, never fixed). Renamed from attnInitDummyWeights to reflect that it no
+   longer touches any weights. */
+
+static void attnInitRuntimeState(void) {
+
+    uint32_t h, w;
+
+    for (h = 0; h < ATTN_N_HEADS; h += 1) {
+
+        for (w = 0; w < ATTN_CONTEXT_SIZE; w += 1) {
+
+            /* Matches the shape (not the trained values) of a real ALiBi table: a per-head
+               constant slope, linearly decaying with distance from the current position. */
+
+            attnAlibiBias[h][w] = (int8_t)(-(int32_t)w / (int32_t)(h + 1));
+
+        }
+
+    }
+
+    memset(attnKWindowLayer0, 0, sizeof(attnKWindowLayer0));
+
+    memset(attnVWindowTLayer0, 0, sizeof(attnVWindowTLayer0));
+
+    memset(attnWindowLayer1, 0, sizeof(attnExternalWindow_t));
+
+    memset(attnWindowPos, 0, sizeof(attnWindowPos));
+
+    attnStateInitialised = true;
+
+}
+
+/* LayerNorm has no CMSIS-NN int8 kernel (confirmed - none of BatchNorm's "fold into the
+   preceding layer's weights at export time" trick applies here, since LayerNorm's mean/
+   variance are computed per-token at runtime, not fixed after training) - done in float
+   instead. Mean/variance are a plain hand-written reduction rather than CMSIS-DSP's own
+   arm_mean_f32/arm_var_f32 - not a performance choice, a build one: CMSIS-DSP's
+   StatisticsFunctions directory ships both the individual per-function .c files AND a
+   StatisticsFunctions.c aggregator that #includes them all, and this project's Makefile adds
+   every .c file in a source directory it's given - pulling in the whole directory linked both
+   copies of every function and failed with "multiple definition" (confirmed directly). Same
+   convention already used elsewhere in this file for small/simple reductions (e.g.
+   runClassifier() in model_inference.c) rather than pulling in more CMSIS machinery for a
+   64-element loop. arm_sqrt_f32 (a real hardware VSQRT instruction on this Cortex-M4F, not a
+   bit-trick approximation like stftFastPow's - sqrt is one of the few transcendental-ish
+   operations this FPU actually has natively) is still used for the standard deviation - it's
+   header-only/inline (see arm_math.h), no separate source file to conflict.
+
+   gamma/beta are omitted (identity) - this probe only needs a realistic AMOUNT of floating-
+   point work per call, not trained affine parameters that don't exist yet anyway. Dequantizes
+   with a fixed, arbitrary scale (1.0) and requantizes the same way - again, only the
+   operation COUNT matters here. */
+
+static void attnLayerNorm(int8_t *data, uint32_t n) {
+
+    float32_t buffer[ATTN_EMBED_DIM];
+
+    uint32_t i;
+
+    float32_t sum = 0.0f;
+
+    for (i = 0; i < n; i += 1) {
+
+        buffer[i] = (float32_t)data[i];
+
+        sum += buffer[i];
+
+    }
+
+    float32_t mean = sum / (float32_t)n;
+
+    float32_t sumSquaredDiff = 0.0f;
+
+    for (i = 0; i < n; i += 1) {
+
+        float32_t diff = buffer[i] - mean;
+
+        sumSquaredDiff += diff * diff;
+
+    }
+
+    float32_t variance = sumSquaredDiff / (float32_t)n;
+
+    float32_t std;
+
+    arm_sqrt_f32(variance + 1.0e-5f, &std);
+
+    for (i = 0; i < n; i += 1) {
+
+        float32_t normalised = (buffer[i] - mean) / std;
+
+        int32_t quantised = (int32_t)normalised;
+
+        data[i] = (int8_t)(quantised < -128 ? -128 : (quantised > 127 ? 127 : quantised));
+
+    }
+
+}
+
+/* Per-sub-stage breakdown of attnRunLayer() below, accumulated (added to, not overwritten -
+   see ATTN_TIME_STAGE) across every call within a buffer, exactly like attentionMicroseconds
+   itself - so this stays directly comparable (same units, same "whole buffer" scope) to it
+   and to the existing model_inference.c per-stage columns. Added after the very first real
+   hardware measurement (a single aggregate attention_us) came back at ~200ms - more than 3x
+   the entire 64ms buffer budget for ONE layer alone - to find out which specific step is
+   actually responsible before drawing any conclusion about why, see EXPERIMENTS.md. */
+
+typedef struct {
+    uint32_t qkvMicroseconds;
+    uint32_t attentionCoreMicroseconds;
+    uint32_t outProjMicroseconds;
+    uint32_t layerNorm1Microseconds;
+    uint32_t ffnMicroseconds;
+    uint32_t layerNorm2Microseconds;
+} AttnLayerTiming_t;
+
+#define ATTN_TIME_STAGE(field, call) { \
+    uint32_t attnStageStartTime, attnStageStartUs, attnStageEndTime, attnStageEndUs; \
+    AudioMoth_getTimeMicroseconds(&attnStageStartTime, &attnStageStartUs); \
+    call; \
+    AudioMoth_getTimeMicroseconds(&attnStageEndTime, &attnStageEndUs); \
+    timing->field += (attnStageEndTime - attnStageStartTime) * MICROSECONDS_IN_SECOND + attnStageEndUs - attnStageStartUs; \
+}
+
+/* Hand-written replacement for arm_nn_vec_mat_mult_t_s8(), specialised for the one case this
+   file ever calls it with: lhs_offset=0, rhs_offset=0, dst_offset=0, bias=NULL, address_offset=1
+   (symmetric quantisation throughout, no bias tensor, contiguous dst). dst[r] = requantize(sum_c
+   lhs[c]*rhs[r*rhs_cols+c]), clamped to int8 - bit-exact with what arm_nn_vec_mat_mult_t_s8 would
+   compute for this same input (verified against its actual source, not assumed), since with both
+   offsets at 0 its own lhs_offset/rhs_offset adjustment terms are no-ops and it calls the same
+   header-inline arm_nn_requantize() with the same (multiplier, shift) this does. See the call
+   sites in attnRunLayer() (idea #2) for why this may or may not be faster than the library call
+   on real hardware - CMSIS-NN's own SMLAD-based DSP path is not a naive loop, so this is an
+   experiment, not a guaranteed win. */
+
+static inline void attnVecMatMultS8(const int8_t *lhs, const int8_t *rhs, int8_t *dst,
+                                    int32_t multiplier, int32_t shift,
+                                    uint32_t rhsCols, uint32_t rhsRows) {
+
+    uint32_t r, c;
+
+    for (r = 0; r < rhsRows; r += 1) {
+
+        const int8_t *rhsRow = rhs + r * rhsCols;
+
+        int32_t acc = 0;
+
+        for (c = 0; c < rhsCols; c += 1) acc += (int32_t)lhs[c] * (int32_t)rhsRow[c];
+
+        acc = arm_nn_requantize(acc, multiplier, shift);
+
+        dst[r] = (int8_t)(acc < -128 ? -128 : (acc > 127 ? 127 : acc));
+
+    }
+
+}
+
+/* One ALiBi windowed-attention encoder layer (self-attention + residual + LayerNorm, FFN +
+   residual + LayerNorm - matches _AlibiEncoderLayer's own post-LN layout exactly, see its
+   docstring) on a single raw-frame embedding. input/output: ATTN_EMBED_DIM int8 each (may
+   alias the same buffer - output is only written at the very end, after every read of
+   input has already happened). layer: which of the ATTN_N_LAYERS stacked layers this call is
+   (see ATTN_N_LAYERS's own comment) - selects which layer's K/V ring buffer to read/update;
+   the weights themselves are shared dummy data across layers (doesn't affect timing, see same
+   comment). Updates that layer's persistent K/V ring buffer as a side effect (see its own
+   comment above) - so repeated calls accumulate real windowed-attention history exactly like
+   the deployed LSTM's own hidden state would, not independent from-scratch calls each time.
+   timing: accumulated into (see ATTN_TIME_STAGE) - the caller zeroes it once per buffer, not
+   once per call. */
+
+static void attnRunLayer(const int8_t *input, int8_t *output, uint32_t layer, AttnLayerTiming_t *timing) {
+
+    if (!attnStateInitialised) attnInitRuntimeState();
+
+    /* layer 0's K/V ring buffer is in internal RAM, layer 1's is in external SRAM - see
+       attnKWindowLayer0/attnWindowLayer1's own comment above for why. Selecting the pointer
+       here (rather than a per-layer array of structs) keeps attnKWindow[h]/attnVWindowT[h]
+       below reading identically regardless of which layer this call is for. */
+
+    int8_t (*attnKWindow)[ATTN_CONTEXT_SIZE][ATTN_HEAD_DIM] = (layer == 0) ? attnKWindowLayer0 : attnWindowLayer1->kWindow;
+
+    int8_t (*attnVWindowT)[ATTN_HEAD_DIM][ATTN_CONTEXT_SIZE] = (layer == 0) ? attnVWindowTLayer0 : attnWindowLayer1->vWindowT;
+
+    cmsis_nn_context ctx = { NULL, 0 };
+
+    cmsis_nn_activation activation = { -128, 127 };
+
+    cmsis_nn_fc_params fcParams = { 0, 0, 0, activation };
+
+    cmsis_nn_per_tensor_quant_params quantParams = { ATTN_DUMMY_MULTIPLIER, ATTN_DUMMY_SHIFT };
+
+    cmsis_nn_dims inputDims = { 1, 1, 1, ATTN_EMBED_DIM };
+
+    /* --- qkv projection (ATTN_EMBED_DIM -> 3*ATTN_EMBED_DIM) --- */
+
+    int8_t qkv[3 * ATTN_EMBED_DIM];
+
+    cmsis_nn_dims qkvFilterDims = { 3 * ATTN_EMBED_DIM, 1, 1, ATTN_EMBED_DIM };
+
+    cmsis_nn_dims qkvBiasDims = { 1, 1, 1, 3 * ATTN_EMBED_DIM };
+
+    cmsis_nn_dims qkvOutputDims = { 1, 1, 1, 3 * ATTN_EMBED_DIM };
+
+    ATTN_TIME_STAGE(qkvMicroseconds,
+        arm_fully_connected_s8(&ctx, &fcParams, &quantParams, &inputDims, input, &qkvFilterDims, attnQkvWeight,
+                               &qkvBiasDims, attnQkvBias, &qkvOutputDims, qkv))
+
+    int8_t *q = qkv;
+
+    int8_t *k = qkv + ATTN_EMBED_DIM;
+
+    int8_t *v = qkv + 2 * ATTN_EMBED_DIM;
+
+    /* --- append this frame's K/V to the ring buffers, advance the write position --- */
+
+    uint32_t h, i;
+
+    for (h = 0; h < ATTN_N_HEADS; h += 1) {
+
+        for (i = 0; i < ATTN_HEAD_DIM; i += 1) {
+
+            attnKWindow[h][attnWindowPos[layer]][i] = k[h * ATTN_HEAD_DIM + i];
+
+            attnVWindowT[h][i][attnWindowPos[layer]] = v[h * ATTN_HEAD_DIM + i];
+
+        }
+
+    }
+
+    attnWindowPos[layer] = (attnWindowPos[layer] + 1) % ATTN_CONTEXT_SIZE;
+
+    /* --- per-head windowed attention: Q.K^T (+ALiBi), softmax, attn.V --- */
+
+    int8_t attnOut[ATTN_EMBED_DIM];
+
+    /* Speedup idea #2 (see this session's own design discussion, EXPERIMENTS.md): replace the
+       8 per-layer arm_nn_vec_mat_mult_t_s8 calls (4 heads x (Q.K^T, attn.V)) with a hand-written,
+       inlined dot-product loop, attnVecMatMultS8() (defined above attnRunLayer). Idea #1 (batching
+       all heads' softmax into one arm_softmax_s8 call) was tried first and measured on real
+       hardware to save only ~0.5% of attn_core_us - reverted back to one arm_softmax_s8 call per
+       head below (per-head scores[]/attnWeights[], not the shared [ATTN_N_HEADS][...] arrays idea
+       #1 used).
+
+       IMPORTANT CAVEAT (found by reading arm_nn_vec_mat_mult_t_s8.c's actual source in full before
+       writing this, not assumed): on this target (Cortex-M4, ARM_MATH_DSP defined, no MVE), the
+       rhs_offset==0 path we hit (our quantization is symmetric, rhs_offset is always 0) is NOT a
+       naive scalar loop - it already uses SMLAD-based paired 16-bit MACs and processes 2 output
+       rows per iteration. So attnVecMatMultS8()'s plain scalar loop is doing MORE arithmetic
+       instructions per element than the library call, not fewer. What it removes instead is: the
+       15-argument call's stack-marshaled-argument setup (paid once per call), the unconditional
+       lhs_offset SXTAB16 adjustment the library applies even though our lhs_offset is always 0,
+       and the row-pairing/remainder-handling bookkeeping paid once per row regardless of how few
+       columns there are (which is the likely reason attn_core barely shrank when embed_dim halved:
+       ATTN_CONTEXT_SIZE, i.e. the row count for Q.K^T, stayed fixed at 32, so that per-row
+       bookkeeping cost didn't shrink with embed_dim even though the column-wise MAC work did).
+       Net effect on real hardware is genuinely uncertain either direction - unlike idea #1, this
+       is flagged upfront as an experiment, not a confident prediction. */
+
+    int8_t scores[ATTN_CONTEXT_SIZE];
+
+    int8_t attnWeights[ATTN_CONTEXT_SIZE];
+
+    ATTN_TIME_STAGE(attentionCoreMicroseconds,
+    {
+        for (h = 0; h < ATTN_N_HEADS; h += 1) {
+
+            attnVecMatMultS8(q + h * ATTN_HEAD_DIM, (const int8_t *)attnKWindow[h], scores,
+                             ATTN_DUMMY_MULTIPLIER, ATTN_DUMMY_SHIFT, ATTN_HEAD_DIM, ATTN_CONTEXT_SIZE);
+
+            for (i = 0; i < ATTN_CONTEXT_SIZE; i += 1) {
+
+                int32_t biased = (int32_t)scores[i] + (int32_t)attnAlibiBias[h][i];
+
+                scores[i] = (int8_t)(biased < -128 ? -128 : (biased > 127 ? 127 : biased));
+
+            }
+
+            arm_softmax_s8((const int8_t *)scores, 1, ATTN_CONTEXT_SIZE, ATTN_DUMMY_MULTIPLIER, ATTN_DUMMY_SHIFT,
+                           -255, attnWeights);
+
+            attnVecMatMultS8(attnWeights, (const int8_t *)attnVWindowT[h], attnOut + h * ATTN_HEAD_DIM,
+                             ATTN_DUMMY_MULTIPLIER, ATTN_DUMMY_SHIFT, ATTN_CONTEXT_SIZE, ATTN_HEAD_DIM);
+
+        }
+    })
+
+    /* --- output projection, residual, LayerNorm --- */
+
+    int8_t projOut[ATTN_EMBED_DIM];
+
+    cmsis_nn_dims squareFilterDims = { ATTN_EMBED_DIM, 1, 1, ATTN_EMBED_DIM };
+
+    cmsis_nn_dims squareBiasDims = { 1, 1, 1, ATTN_EMBED_DIM };
+
+    cmsis_nn_dims squareOutputDims = { 1, 1, 1, ATTN_EMBED_DIM };
+
+    ATTN_TIME_STAGE(outProjMicroseconds,
+        arm_fully_connected_s8(&ctx, &fcParams, &quantParams, &inputDims, attnOut, &squareFilterDims, attnOutProjWeight,
+                               &squareBiasDims, attnOutProjBias, &squareOutputDims, projOut))
+
+    int8_t hidden[ATTN_EMBED_DIM];
+
+    for (i = 0; i < ATTN_EMBED_DIM; i += 1) {
+
+        int32_t sum = (int32_t)projOut[i] + (int32_t)input[i];
+
+        hidden[i] = (int8_t)(sum < -128 ? -128 : (sum > 127 ? 127 : sum));
+
+    }
+
+    ATTN_TIME_STAGE(layerNorm1Microseconds, attnLayerNorm(hidden, ATTN_EMBED_DIM))
+
+    /* --- feedforward: linear1 -> ReLU -> linear2, residual, LayerNorm --- */
+
+    int8_t ffnHidden[ATTN_FFN_DIM];
+
+    cmsis_nn_dims ffn1FilterDims = { ATTN_FFN_DIM, 1, 1, ATTN_EMBED_DIM };
+
+    cmsis_nn_dims ffn1BiasDims = { 1, 1, 1, ATTN_FFN_DIM };
+
+    cmsis_nn_dims ffn1OutputDims = { 1, 1, 1, ATTN_FFN_DIM };
+
+    int8_t ffnOut[ATTN_EMBED_DIM];
+
+    cmsis_nn_dims ffnInputDims = { 1, 1, 1, ATTN_FFN_DIM };
+
+    ATTN_TIME_STAGE(ffnMicroseconds,
+    {
+        arm_fully_connected_s8(&ctx, &fcParams, &quantParams, &inputDims, hidden, &ffn1FilterDims, attnLinear1Weight,
+                               &ffn1BiasDims, attnLinear1Bias, &ffn1OutputDims, ffnHidden);
+
+        arm_relu_q7(ffnHidden, ATTN_FFN_DIM);
+
+        arm_fully_connected_s8(&ctx, &fcParams, &quantParams, &ffnInputDims, ffnHidden, &squareFilterDims, attnLinear2Weight,
+                               &squareBiasDims, attnLinear2Bias, &squareOutputDims, ffnOut);
+    })
+
+    for (i = 0; i < ATTN_EMBED_DIM; i += 1) {
+
+        int32_t sum = (int32_t)ffnOut[i] + (int32_t)hidden[i];
+
+        output[i] = (int8_t)(sum < -128 ? -128 : (sum > 127 ? 127 : sum));
+
+    }
+
+    ATTN_TIME_STAGE(layerNorm2Microseconds, attnLayerNorm(output, ATTN_EMBED_DIM))
+
+}
+
+#endif
+
 #if STFT_DEBUG_MODE
 
 /* Replaces the normal recording ISR: instead of filtering the buffer into the SD card recording pipeline, compute its STFT and time how long that takes */
@@ -3242,6 +3985,51 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     uint32_t inferenceMicroseconds = (inferenceEndTime - inferenceStartTime) * MICROSECONDS_IN_SECOND + inferenceEndMicroseconds - inferenceStartMicroseconds;
 
+#if STFT_DEBUG_ATTENTION_TEST
+
+    /* Isolated ALiBi attention-layer compute-cost probe (see attnRunLayer()'s own comment
+       above, and STFT_DEBUG_ATTENTION_TEST's) - timed separately, alongside the real
+       STFT/LSTM timing above, not instead of it: this never touches stftSpectrogramDb,
+       ModelInference_run(), or anything the real classifier reads, so the real LSTM timing
+       and logit above stay exactly what they always were. Runs the full ATTN_N_LAYERS-deep
+       stack STFT_NUMBER_OF_FRAMES times, matching TinyViT's own raw-STFT-frame resolution (one
+       set of calls per raw frame, not one per buffer - see student_model.py's frame_logits()/
+       adaptive_avg_pool1d and this section's own header comment on why). Each layer's output
+       feeds the next layer's input (attnLayerBuffer), and each frame's final (layer-N) output
+       feeds back as the NEXT frame's layer-0 input (a real, if dummy-weighted, continuous
+       stream of frame embeddings, not the same static input every time) - the K/V ring
+       buffers persist across buffers exactly like they would in real continuous deployment.
+       Real checkpoint depth is ATTN_N_LAYERS=2 (see its own comment) - single-layer numbers
+       measured before this understated the real stacked cost. */
+
+    static int8_t attnDummyEmbedding[ATTN_EMBED_DIM];
+
+    uint32_t attentionStartTime, attentionStartMicroseconds;
+
+    AudioMoth_getTimeMicroseconds(&attentionStartTime, &attentionStartMicroseconds);
+
+    AttnLayerTiming_t attnTiming = { 0, 0, 0, 0, 0, 0 };
+
+    uint32_t attnFrame, attnLayer;
+
+    for (attnFrame = 0; attnFrame < STFT_NUMBER_OF_FRAMES; attnFrame += 1) {
+
+        for (attnLayer = 0; attnLayer < ATTN_N_LAYERS; attnLayer += 1) {
+
+            attnRunLayer(attnDummyEmbedding, attnDummyEmbedding, attnLayer, &attnTiming);
+
+        }
+
+    }
+
+    uint32_t attentionEndTime, attentionEndMicroseconds;
+
+    AudioMoth_getTimeMicroseconds(&attentionEndTime, &attentionEndMicroseconds);
+
+    uint32_t attentionMicroseconds = (attentionEndTime - attentionStartTime) * MICROSECONDS_IN_SECOND + attentionEndMicroseconds - attentionStartMicroseconds;
+
+#endif
+
     /* In binary mode, the raw audio and the spectrogram just computed are also copied into the next free record. That copy (a few KB to external SRAM) happens after elapsedMicroseconds is captured, so that value still reflects only the STFT computation, comparable with earlier measurements. */
 
     uint32_t nextWriteIndex = (stftRecordQueueWriteIndex + 1) & (STFT_RECORD_QUEUE_LENGTH - 1);
@@ -3265,6 +4053,24 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
         stftRecordQueue[stftRecordQueueWriteIndex].inferenceMicroseconds = inferenceMicroseconds;
 
         stftRecordQueue[stftRecordQueueWriteIndex].modelTiming = modelTiming;
+
+#if STFT_DEBUG_ATTENTION_TEST
+
+        stftRecordQueue[stftRecordQueueWriteIndex].attentionMicroseconds = attentionMicroseconds;
+
+        stftRecordQueue[stftRecordQueueWriteIndex].attnQkvMicroseconds = attnTiming.qkvMicroseconds;
+
+        stftRecordQueue[stftRecordQueueWriteIndex].attnCoreMicroseconds = attnTiming.attentionCoreMicroseconds;
+
+        stftRecordQueue[stftRecordQueueWriteIndex].attnOutProjMicroseconds = attnTiming.outProjMicroseconds;
+
+        stftRecordQueue[stftRecordQueueWriteIndex].attnLayerNorm1Microseconds = attnTiming.layerNorm1Microseconds;
+
+        stftRecordQueue[stftRecordQueueWriteIndex].attnFfnMicroseconds = attnTiming.ffnMicroseconds;
+
+        stftRecordQueue[stftRecordQueueWriteIndex].attnLayerNorm2Microseconds = attnTiming.layerNorm2Microseconds;
+
+#endif
 
 #endif
 
@@ -3355,9 +4161,25 @@ static void runSTFTFeasibilityTest(void) {
 
 #else
 
-    static char lineBuffer[224];
+    /* 224 was enough for the original 11-column CSV (confirmed: max real row length well
+       under that). STFT_DEBUG_ATTENTION_TEST's extra 7 columns push the HEADER row alone to
+       230 bytes - over the old 224-byte buffer (confirmed by direct measurement, not just
+       eyeballing after this file's build test - a real stack buffer overflow, since sprintf
+       here has no bounds checking). 384 comfortably covers both the header and the widest
+       plausible data row (18 uint32 fields, each up to 10 digits + a comma) with real margin
+       to spare, not just enough to survive today's exact column count. */
+
+    static char lineBuffer[384];
+
+#if STFT_DEBUG_ATTENTION_TEST
+
+    uint32_t lineLength = sprintf(lineBuffer, "buffer_index,stft_time_us,inference_time_us,stage0_us,stage1_dw_us,stage1_pw_us,stage2_dw_us,stage2_pw_us,avgpool_us,lstm_us,classifier_us,attention_us,attn_qkv_us,attn_core_us,attn_outproj_us,attn_ln1_us,attn_ffn_us,attn_ln2_us\r\n");
+
+#else
 
     uint32_t lineLength = sprintf(lineBuffer, "buffer_index,stft_time_us,inference_time_us,stage0_us,stage1_dw_us,stage1_pw_us,stage2_dw_us,stage2_pw_us,avgpool_us,lstm_us,classifier_us\r\n");
+
+#endif
 
     AudioMoth_writeToFile(lineBuffer, lineLength);
 
@@ -3401,6 +4223,30 @@ static void runSTFTFeasibilityTest(void) {
 
 #else
 
+#if STFT_DEBUG_ATTENTION_TEST
+
+            lineLength = sprintf(lineBuffer, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].bufferIndex,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].elapsedMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].inferenceMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage0Microseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage1DepthwiseMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage1PointwiseMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage2DepthwiseMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.stage2PointwiseMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.avgPoolMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.lstmMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.classifierMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].attentionMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].attnQkvMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].attnCoreMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].attnOutProjMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].attnLayerNorm1Microseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].attnFfnMicroseconds,
+                (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].attnLayerNorm2Microseconds);
+
+#else
+
             lineLength = sprintf(lineBuffer, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
                 (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].bufferIndex,
                 (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].elapsedMicroseconds,
@@ -3413,6 +4259,8 @@ static void runSTFTFeasibilityTest(void) {
                 (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.avgPoolMicroseconds,
                 (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.lstmMicroseconds,
                 (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].modelTiming.classifierMicroseconds);
+
+#endif
 
             AudioMoth_writeToFile(lineBuffer, lineLength);
 
@@ -3433,17 +4281,27 @@ static void runSTFTFeasibilityTest(void) {
 #elif TRIGGERED_RECORDING_MODE
 
 /* Continuously listens and runs the classifier every 64ms buffer; whenever its output
-   crosses TRIGGER_LOGIT_THRESHOLD, records a new WAV file (with TRIGGER_PREROLL_SECONDS of
-   pre-roll audio), keeping it open while re-triggered (a sliding TRIGGER_TAIL_SECONDS
+   crosses TRIGGER_PROBABILITY_THRESHOLD, records a new WAV file (with TRIGGER_PREROLL_SECONDS
+   of pre-roll audio), keeping it open while re-triggered (a sliding TRIGGER_TAIL_SECONDS
    countdown, reset on every re-trigger) and closing it once the countdown lapses - one
    distinct file per detection event, not one continuous file with gaps (unlike the existing
    amplitude/frequency trigger feature in makeRecording() below, which never splits files). */
 
-/* sigmoid(0) = 0.5; the raw logit is compared directly (monotonic, so equivalent to a
-   probability threshold) to avoid an expf() call every buffer. Tune based on the PR-curve
-   data test-audiomoth-cnn/export_int8.py already produces. */
+/* Tune this directly - the probability threshold from the PR-curve data
+   test-audiomoth-cnn/export_int8.py already produces - rather than triggerLogitThreshold
+   (see below), which is derived from it once at recording start, not something to edit by
+   hand: logf()/expf() are too expensive to call every buffer in the ISR, but computing the
+   equivalent raw-logit threshold a single time and comparing the raw logit against that
+   (monotonic with sigmoid, so equivalent) costs nothing per buffer. */
 
-#define TRIGGER_LOGIT_THRESHOLD                   -0.5596f
+#define TRIGGER_PROBABILITY_THRESHOLD              0.2f
+
+/* logit(p) = ln(p/(1-p)), the inverse of sigmoid - see TRIGGER_PROBABILITY_THRESHOLD's
+   comment above. Computed once in runTriggeredRecording()'s init, not a compile-time
+   constant (logf() isn't guaranteed to fold at compile time), so this is a variable, not a
+   #define - matches triggerSampleMultiplier's own "computed once at init" pattern below. */
+
+static float triggerLogitThreshold;
 
 #define TRIGGER_TAIL_SECONDS                      5.0f
 #define TRIGGER_PREROLL_SECONDS                   0.75f
@@ -3572,7 +4430,7 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     static uint32_t tailCountdown;
 
-    bool triggered = logit > TRIGGER_LOGIT_THRESHOLD;
+    bool triggered = logit > triggerLogitThreshold;
 
     if (recordingActive == false) {
 
@@ -3885,6 +4743,11 @@ static void runTriggeredRecording(void) {
     if (AudioMoth_hasInvertedOutput()) triggerSampleMultiplier = -triggerSampleMultiplier;
 
     if (triggerExternalMicrophone == AM_EXTERNAL_PRESENT_AND_USED) triggerSampleMultiplier = -triggerSampleMultiplier;
+
+    /* See TRIGGER_PROBABILITY_THRESHOLD's comment above - computed once here rather than a
+       #define so the ISR never calls logf() itself. */
+
+    triggerLogitThreshold = logf(TRIGGER_PROBABILITY_THRESHOLD / (1.0f - TRIGGER_PROBABILITY_THRESHOLD));
 
     triggerBufferCounter = 0;
 

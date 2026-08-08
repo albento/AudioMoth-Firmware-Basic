@@ -306,6 +306,40 @@ tick boundary the start/end samples land on), and why every other per-stage colu
 in ~30 µs steps between runs of the same buffer - real execution time is stable, the
 apparent jitter is clock quantization, not measurement noise.
 
+### `lstm-hidden-size=64` comparison (same architecture otherwise)
+
+Exploring whether the frame-level precision plateau (see "Model training" section below) is a
+capacity problem rather than a data/normalization one: re-exported with `--lstm-hidden-size 64`
+(channels unchanged, `16,32,64`) and re-measured with the same `STFT_DEBUG_MODE`/CSV setup, 123
+buffers, real hardware.
+
+| Stage | hidden=16 (µs) | hidden=64 (µs) | Δ |
+|---|---|---|---|
+| stage0 | 9063 | 9920 | +9.5% |
+| stage1_dw | 7141 | 7142 | ~0% |
+| stage1_pw | 6805 | 6793 | ~0% (clock quantization) |
+| stage2_dw | 3449 | 3451 | ~0% |
+| stage2_pw | 4242 | 4234 | ~0% (clock quantization) |
+| avgpool | 244 | 239 | ~0% (clock quantization) |
+| LSTM step | 672 | **3299** | **×4.9** |
+| classifier | 0 | ~16 (0 or 30-31, see timer caveat above) | clock quantization |
+| **Inference total** | 32868 | **36092** | **+9.8%** |
+| Buffer total (STFT+inference) | 37354 (58.4% of 64ms) | **40877 (63.9% of 64ms)** | +5.5 points |
+
+LSTM step scales ×4.9, somewhat better than the ×6.4 naive MAC-count prediction
+(`input_size*hidden_size + hidden_size*hidden_size` per gate, ×4 gates: 5120 -> 32768 MACs) -
+consistent with a fixed per-call overhead that doesn't grow with `hidden_size`. Every conv
+stage's cost is unchanged (they depend on `channels`, not `lstm-hidden-size`), except stage0,
+which moved +9.5% (9063 -> 9920 µs) despite having zero code-level dependency on hidden size -
+the same `.text`-layout-shift-from-an-unrelated-binary-size-change effect already measured
+above (see the rejected hand-written pointwise conv, where stage0 moved +15.2% from a change
+that never touched it). The LSTM weight arrays growing (~29KB more flash - confirmed by a
+build with dummy hidden=64 weights before the real training run even finished, `.text`
+159928 -> 188600 bytes) is the most likely trigger here too.
+
+Still comfortably inside the 64ms budget (63.9%, ~36% margin left) if `hidden=64` turns out to
+help the frame-level metric enough to justify it.
+
 ## Device-vs-PC numerical parity (STFT, RMS normalization, and INT8 model bugs)
 
 After the model ran end-to-end on-device (previous section), the next question was whether it
@@ -623,3 +657,248 @@ a test harness never meant to produce real listenable recordings):
 - Debug firmware must not assume the SD card is present: `AudioMoth_enableFileSystem()` /
   `AudioMoth_openFile()` failures are retried in a loop with a visible LED signal, recoverable by
   inserting the card without re-flashing.
+
+## On-device PCEN (`STFT_NORMALIZATION_PCEN`)
+
+Ported while the corresponding `NORMALIZATION_MODE=pcen` training run (learnable per-band
+alpha/delta/r/ema_alpha - see `test-audiomoth-cnn/student_model.py`'s `LearnablePCEN`) was
+still in progress, so the firmware mechanism could be built/size/build-tested ahead of the
+real checkpoint rather than after it - `model/pcen.h`/`pcen.c` briefly shipped as a
+placeholder (untrained init values replicated across every bin) for that reason, now replaced
+(see below) by a real export.
+
+**`model/pcen.h`/`pcen.c` now hold real learned values**, exported via `export_pcen.py` from
+`distill/student_cnn_lstm_small_64_learned_pcen.pt` (50000x2 training clips, hidden=64,
+pos-weight) - test-set results: clip AP 99.2%/P@R95 97.7%, frame AP 92.4%/P@R95 69.1%, the
+best of every normalization scheme compared this session (EMA 58.9%, none 59.3%, fixed PCEN
+65.1%, learned PCEN 69.1% - all frame-level P@R95, the primary metric). Learned per-band
+values sanity-checked before export: no band saturated at alpha/ema_alpha's sigmoid bounds (0
+or 1) or otherwise implausible (alpha in [0.75, 0.99], delta in [0.24, 3.13], r in [0.21,
+0.82], ema_alpha in [0.0086, 0.077] - i.e. bands learned to react noticeably *faster* than the
+~3s fixed-PCEN init in places, never degenerately fast/slow) - no sign of the per-band
+overfitting flagged as a risk when learnable PCEN was first implemented. Regenerate again
+(`export_pcen.py`'s own docstring has the exact command) whenever this checkpoint is retrained
+- do not hand-edit, and do not mix pcen.h/pcen.c from one checkpoint with model.h/model.c from
+another.
+
+### Why PCEN needs its own numeric approximation, not just `stftFastLog10`
+
+PCEN's compression curve, `(E/(M+eps)^alpha + delta)^r - delta^r`, uses two fractional
+exponents (`alpha`, `r`) that are *learned per frequency bin*, not a single fixed exponent
+the way `stftFastLog10` always computes base-10 log. `stftFastLog10`'s bit-trick (reinterpret
+a float's IEEE-754 bits as a linear-in-mantissa approximation of `log2(x)`, then one Q16.16
+fixed-point multiply to convert to `log10`) can't be reused as-is for an arbitrary exponent -
+so `stftFastPow(x, a) = exp2(a * log2(x))` was added, reusing `stftFastLog2Q16_16()` exactly
+(same bias constant) and adding its algebraic inverse, `stftFastExp2Q16_16()` (the same bit
+trick run backwards: reconstruct a float's bits from a Q16.16 log2 value). This is the same
+approximation quality already validated and deployed for `stftFastLog10` (~0.26dB / ~3% worst
+case on one log10 call), not a new/unproven numerical scheme.
+
+Validated end-to-end (not just the isolated `pow()` call) against exact float64 PCEN on a
+real recording (`long_speech_test.wav`, 3749 frames): mean absolute error 0.052, p99 0.135,
+against PCEN's own ~0-14 output range - both compounded `pow()` calls included, computed with
+the same fixed-point bias/rounding the C code uses. Isolated `pow()` error alone (synthetic,
+covering PCEN's realistic input ranges) is ~1-6% relative, worse in the worst case than the
+end-to-end PCEN error above - the two `pow()` calls partially cancel rather than compound
+worst-case-to-worst-case in practice.
+
+### Integration
+
+- `STFT_NORMALIZATION_MODE` gains a third value, `STFT_NORMALIZATION_PCEN` (`EMA`=0, `NONE`=1,
+  `PCEN`=2) - still compile-time only, same pattern as `STFT_DEBUG_MODE`/
+  `TRIGGERED_RECORDING_MODE`.
+- `computeBufferGain()` returns `1.0f` in PCEN mode, same as `NONE` - PCEN's own adaptation
+  happens *after* the FFT, on the per-bin magnitude, not as a waveform-domain gain before it
+  (matching `student_model.py`: `NORMALIZATION_MODE=pcen` skips `streaming_rms_normalize()`
+  entirely, same as `none`).
+- `computeSpectrogram()` gains a new branch (ahead of, and independent from, the existing
+  `STFT_LOG_MODE` dB-variant switch, which it bypasses entirely - PCEN doesn't take a log at
+  all) that calls a new per-bin helper, `computePcenBin()`, which updates a **persistent
+  per-bin** running state `pcenRunningM[STFT_NUMBER_OF_BINS]` (the PCEN equivalent of
+  `stftRunningMeanSq`, but one value per frequency bin instead of one global scalar - reset
+  once per recording from `model_pcen_initial_m`, never mid-recording, same convention as the
+  EMA scheme's own reset).
+- Masked (sub-150Hz) bins need no special-casing beyond the existing magnitude-zeroing: PCEN
+  of an always-zero input is always exactly `delta^r - delta^r == 0`, regardless of the
+  learned per-bin constants or `M`'s state - the same "fixed, magnitude-independent output"
+  property every other `STFT_LOG_MODE` variant already relies on for those bins.
+
+### Flash/RAM footprint (build-tested via `AudioMoth-Project`, both placeholder AND real `pcen.h`/`pcen.c` - identical, since array shapes don't depend on the values)
+
+| | `.text` | `.bss` |
+|---|---|---|
+| `STFT_NORMALIZATION_EMA` (baseline, unchanged) | 188600 | 23008 |
+| `STFT_NORMALIZATION_PCEN` | 192208 (+3608) | 23520 (+512) |
+
+`.bss`'s `+512B` is exactly accounted for: `pcenRunningM[129]` (+516B) minus the now-compiled-out
+`stftRunningMeanSq` (-4B). `.text`'s `+3608B` is dominated by `pcen.c`'s own baked-in constants
+(6 arrays x 129 bins x 4B = 3096B) plus the new `stftFastPow`/`computePcenBin`/`computeSpectrogram`
+branch code, minus the EMA-only code (`computeBufferGain`'s accumulate loop, `stftFastLog10`
+calls) it replaces. `STFT_NORMALIZATION_EMA` (still the default, unchanged) built to the
+byte-identical baseline both before and after this change - the new code is fully compiled out
+of the default build, not merely dead-code-eliminated at link time. Confirmed identical between
+the placeholder and real-weights builds too, as expected (same array sizes, only values differ).
+
+No real hardware timing measurement yet (no SWD probe available - see project notes); a rough
+op-count estimate (`computePcenBin` does ~2 `stftFastPow` calls plus a handful of multiply/add/
+divide per bin, x129 bins x7 frames/buffer) suggests a modest increase over the existing
+~10.9ms/buffer STFT measurement, still comfortably inside the 64ms budget - but this is an
+estimate, not a measurement. Use the existing `STFT_DEBUG_MODE` CSV timing infrastructure
+(`ModelInferenceTiming_t`, per-stage `elapsedMicroseconds`) to get a real number now that this
+is flashable with real (non-placeholder) `pcen.h`/`pcen.c`.
+
+### Still needed before this is actually deployable
+
+1. ~~Regenerate `model/pcen.h`/`pcen.c` for real~~ - done (see above).
+2. **Real hardware timing** (see above) - the op-count estimate is not a substitute.
+3. **Device-vs-PC numerical parity check**, the same rigor as the EMA/log10 path already got
+   (see "Device-vs-PC numerical parity" above) - `compare_device_output.py` does not yet know
+   about PCEN mode at all; extending it (or a PCEN-specific equivalent) to replay
+   `stftFastPow`/`computePcenBin`'s exact fixed-point arithmetic in Python and compare against
+   a real on-device capture has not been done, only the Python-side bit-trick simulation vs
+   exact float64 PCEN (above).
+
+## ViT attention-layer compute-cost probe (`STFT_DEBUG_ATTENTION_TEST`)
+
+A dummy-weight, single-layer ALiBi windowed-attention encoder layer (`attnRunLayer()`),
+compiled into `STFT_DEBUG_MODE` alongside (not instead of) the real STFT/LSTM/PCEN pipeline,
+purely to get a real hardware timing number for whether the trained ViT
+(`student_cnn_vit_alibi_pcen.pt`, embed_dim=64/n_heads=4/context_size=32/depth=2) could
+plausibly run in real time - see this session's own design discussion for the back-of-envelope
+MAC-count estimate (~800k MAC/buffer, ~15-20ms) this is meant to replace with a measurement.
+**Never touches `model_inference.c`/`model.h`/the real LSTM classifier** - the deployed
+LSTM path keeps working exactly as before, in this mode and every other; this is purely an
+additional, optional measurement, gated behind its own flag.
+
+### Enabling it
+
+1. Set both `STFT_DEBUG_MODE` and the new `STFT_DEBUG_ATTENTION_TEST` to `1` in `main.c`
+   (`TRIGGERED_RECORDING_MODE` must be `0` - they're mutually exclusive, same as always).
+2. Add `SoftmaxFunctions`/`arm_softmax_s8` to the build - **not present in
+   `AudioMoth-Project/build/Makefile`'s default `SRC` list**, confirmed directly (a clean
+   `STFT_DEBUG_ATTENTION_TEST=1` build fails at link time otherwise). Append
+   `$(CMSIS_NN_PATH)/Source/SoftmaxFunctions` to the `SRC =` line (line 23 at the time of
+   writing) - **anchor the edit to that exact line** (`sed -i '23s#$# ...#'` or equivalent),
+   not a substring match on `SRC = `: `_CSRC`/`_SSRC` (the derived object-list lines just below
+   `SRC`) both contain that same substring (`_CSRC = `, `_SSRC = `) and get silently corrupted
+   by an unanchored replace, confirmed the hard way. Do **not** also add
+   `CMSIS-DSP/Source/StatisticsFunctions` - see the "LayerNorm" note below.
+3. Rebuild. Footprint is config-dependent (`ATTN_EMBED_DIM`, `ATTN_N_LAYERS`) and changed
+   several times across this probe's own evolution (see Results below) - at the final
+   configuration measured (embed_dim=32, depth=2, dummy weights in flash, layer 0's K/V in
+   internal RAM/layer 1's in external SRAM): flash usage ~220.7KB/256KB (~41.5KB headroom),
+   `.bss` +2KB over the non-attention-test baseline (just layer 0's K/V window - everything
+   else in this probe now lives in flash or external SRAM). Confirmed clean at every step
+   (real build, real link) before being written up.
+
+### Design notes worth keeping in mind before reading real numbers
+
+- **Genuinely windowed, not dense**: unfolds K/V into `context_size`-wide windows
+  (`arm_nn_vec_mat_mult_t_s8`, not the dense `q @ k.T` a naive port would do) - matches the
+  training-side fix (see `_AlibiSelfAttention`'s own docstring in `student_model.py`) that cut
+  a >4x wall-clock training slowdown down to something tractable; a dense on-device version
+  would be a dramatically less realistic (slower) measurement.
+- **Runs `STFT_NUMBER_OF_FRAMES` (7) times per 64ms buffer**, not once - TinyViT's own
+  attention operates at raw-STFT-frame resolution, only pooling down to buffer resolution at
+  the classifier's output (confirmed empirically on the training side - see this session's own
+  "context_size in frames, not buffers" clarification). Reading only a single call's cost
+  here would understate the real per-buffer budget by 7x.
+- **Memory placement evolved across this probe's own history, and turned out to matter more
+  than any compute-side change tried** (see Results below for the numbers). Final state:
+  weights are `const` arrays generated into `src/attn_dummy_weights.h`
+  (`scripts/gen_attn_dummy_weights.py`), placed in flash by the linker, exactly like a real
+  exported ViT's weights would be (like `model.h`'s own). K/V ring buffers are genuine runtime
+  state (never `const`) - layer 0's fits internal RAM (2KB); layer 1's doesn't (internal RAM
+  had no headroom left with layer 0's buffer already in it), so it falls back to external SRAM,
+  same as every array here originally did before this was investigated. This history is kept
+  in the Results section below because the *size* of each move (not just its direction) was
+  itself the finding.
+- **LayerNorm's mean/variance are a hand-written float loop, not CMSIS-DSP's own
+  `arm_mean_f32`/`arm_var_f32`** - not a performance choice: `CMSIS-DSP/Source/StatisticsFunctions`
+  ships both the individual per-function files and a `StatisticsFunctions.c` aggregator that
+  `#include`s all of them, and this Makefile's wildcard-based `SRC` mechanism pulls in every
+  `.c` file in a given directory - added as a whole directory, this produced "multiple
+  definition" link errors for every statistics function, confirmed directly. `arm_sqrt_f32` is
+  still used (inline in `arm_math.h`, no separate source file to conflict).
+- **Dummy weights/ALiBi table/input are placeholder values** (a small deterministic pattern,
+  not exported from the real checkpoint) - this measures compute cost, not accuracy; nothing
+  here should be used to draw any conclusion about the model's real output.
+
+### Results
+
+All measured on real hardware (the user flashed and reported CSV output at each step - no SWD
+probe available on this dev machine, see project notes). Budget throughout: 64ms (one buffer).
+
+**1. Baseline, embed_dim=64 (matches `student_cnn_vit_alibi_pcen.pt`), single layer, no
+optimization**: `attention_us` ~195-209ms - **>3x over budget**. Per-substage breakdown (added
+right after this first number came back so catastrophically over): qkv 56243us, attn_core
+24628us, out_proj 7202us, LayerNorm 580us x2, FFN 105470us (**~50% of the total, the single
+largest stage**).
+
+**2. embed_dim=32 (half), single layer, otherwise identical**: `attention_us` ~66-71ms -
+**~1.05-1.11x over budget**. qkv 15075us (3.7x smaller, close to the ideal 4x from halving both
+matmul dimensions), out_proj 2165us (3.3x smaller), FFN 28075us (3.76x smaller, still ~40% of
+the total), LayerNorm ~275us x2 (~2.1x smaller, expected for an O(n) hand loop). **attn_core
+only dropped to 20568us (1.2x, not the ~2x its own MAC count would predict)** - the one stage
+that didn't scale down with embed_dim, and the reason for everything that follows.
+
+**3. Idea #1 - batch all 4 heads' softmax into one `arm_softmax_s8` call** (`num_rows=4`
+instead of 4x `num_rows=1`) instead of attn_core's fixed cost being softmax's own per-call
+setup: attn_core 20568 → 20445us, **~0.5% - negligible**. Reverted per direct instruction after
+this result came back.
+
+**4. Idea #2 - hand-written Q.K^T/attn.V dot-product loop** (`attnVecMatMultS8()`), replacing
+`arm_nn_vec_mat_mult_t_s8()` to eliminate its 15-argument stack-marshaled call overhead
+(Cortex-M4/AAPCS only passes 4 args in registers): attn_core 20447 → 20126us, **~1.6% -
+also small**. Read the full source of `arm_nn_vec_mat_mult_t_s8.c` before writing this and
+found why: on this target (`ARM_MATH_DSP` defined, no MVE), the path actually compiled already
+uses SMLAD-paired 16-bit MACs and processes 2 output rows/iteration - not a naive scalar loop.
+A hand-written scalar replacement does *more* arithmetic instructions per element, not fewer;
+what it saves (call overhead, an unconditional-but-zero `lhs_offset` adjustment) turned out to
+be small next to that trade. Kept anyway (not reverted) - it's a real, if modest, net win and
+does no harm.
+
+**5. Move K/V ring buffer from external SRAM to internal RAM** (single layer; at
+embed_dim=32/head_dim=8 the window is only 2KB, small enough to fit): attn_core 20126 → 17548us,
+**~12.8% - by far the largest compute-cost-probe-only win up to this point**, and a real
+finding: attn_core's row count (`ATTN_CONTEXT_SIZE=32`, the K/V window size) never changes with
+embed_dim, unlike every other stage - external SRAM's per-access latency, not CPU instruction
+count, was the actual fixed cost neither idea #1 nor #2 could touch. Total `attention_us`
+66284 → 66033 (attn_core is only ~27% of the total, so the effect on the grand total is
+smaller than on attn_core alone).
+
+**6. Move dummy weights from runtime-filled external SRAM to `const` arrays in flash**
+(`attn_dummy_weights.h`, generated by `scripts/gen_attn_dummy_weights.py` with the exact same
+deterministic values, bit-for-bit - isolating storage location as the only variable): **by far
+the single biggest lever in this entire series**. qkv 15076 → 5844us (2.58x), out_proj
+2136 → 1114us (1.92x), FFN 28106 → 10681us (2.63x), attn_core unchanged (17548 → 17716us,
+correctly - it doesn't read these weights, confirming the isolation was clean). **Total
+`attention_us` 66284 → 36362us, a 45% reduction - one layer at embed_dim=32 is now ~43% *under*
+budget (0.57x)**, down from >3x *over* at the very first (embed_dim=64) measurement.
+
+**7. Real depth=2 measurement** (the actual checkpoint's depth - every result above was a
+single layer, understating the real stacked cost). Internal RAM had no room for a second
+2KB K/V window alongside layer 0's (confirmed directly: overflowed), so layer 0 keeps its K/V
+in internal RAM and layer 1 falls back to external SRAM (see "Design notes" above) - making
+layer 1 somewhat pessimistic relative to layer 0. Result: **`attention_us` ~75165-75805us
+(avg 75485), ~1.18x over the 64ms budget (~18% over)**. Every stage but attn_core scaled
+almost exactly 2x from the single-layer numbers (qkv 11703 vs 11688 expected, FFN 21363 vs
+21362, out_proj 2212 vs 2228) - a good internal consistency check that layer-to-layer weight
+sharing doesn't distort the timing. attn_core came in at 38147us vs 35432 expected from a
+clean 2x, implying layer 1 alone cost ~20431us - closely matching step 5's own external-SRAM
+K/V number (20126us), exactly as expected given layer 1's K/V wasn't moved to internal RAM.
+
+**End-to-end summary**: from >3.15x over budget (embed_dim=64, 1 layer, no optimization) to
+**1.18x over budget (embed_dim=32, real depth=2, every implementation-level optimization
+applied)** - driven almost entirely by memory placement (flash for weights, internal RAM for
+K/V where it fits), not by the compute-side rewrites (ideas #1/#2 together saved <2%).
+
+**What's left is no longer a pure-implementation lever**: FFN is now the largest single stage
+(21363us, ~28% of the depth=2 total) at its standard 4x expansion ratio
+(`ATTN_FFN_DIM = 4 * ATTN_EMBED_DIM`). Halving that ratio (2x instead of 4x) would save
+roughly half of FFN's cost (~10.7ms), which would bring the depth=2 total to **~64.8ms - just
+~1.3% over budget**, i.e. very close to feasible. This is a genuine architecture change (a
+narrower FFN expansion), not a firmware rewrite - it needs to be validated on the training side
+first (does `student_cnn_vit_alibi_pcen`-style TinyViT hold onto its accuracy with
+`ffn_ratio=2`?) before any more firmware time goes into it. Recommended next step for
+`test-audiomoth-cnn`, not `AudioMoth-Firmware-Basic`.
