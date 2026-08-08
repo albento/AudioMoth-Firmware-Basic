@@ -2870,16 +2870,6 @@ inline void AudioMoth_handleSwitchInterrupt() {
 
 #define STFT_LOG_EPSILON                          1.0e-6f
 
-/* Matches student_model.py's LogSpectrogram exactly: bins below 150Hz are zeroed (not just
-   attenuated) before the log, a brick-wall cut to discard wind/handling rumble and DC offset
-   that would otherwise show up as high log-magnitude energy the model was never trained to
-   see there. bin_width = STFT_SAMPLE_RATE / STFT_FFT_LENGTH = 62.5Hz; highpass_bin =
-   ceil(150 / 62.5) = 3, so bins 0/1/2 (0Hz/62.5Hz/125Hz) are masked, matching
-   math.ceil(150.0 / bin_width) there bit for bit - only valid for this exact sample
-   rate/FFT length pair, not recomputed generically. */
-
-#define STFT_HIGHPASS_BIN                         3
-
 /* Streaming RMS normalization, matching dataset.streaming_rms_normalize() exactly (see
    test-audiomoth-cnn/dataset.py/CLAUDE notes) - training's old rms_normalize() needed the
    RMS of the entire 3-second clip before it could normalize a single sample, something a
@@ -3297,15 +3287,15 @@ static float computeBufferGain(const int16_t *source) {
    formula 3 times would risk exactly the kind of copy-paste drift this codebase's "one shared
    implementation" convention (e.g. run_feature_stack_s8 on the Python side) exists to avoid.
 
-   Never called with magnitude/power == 0 in a way that matters: for the 3 masked bins
-   (bin < STFT_HIGHPASS_BIN), power is always exactly 0, so ratio is always exactly 0 and the
-   result is always exactly delta^r - delta^r == 0 REGARDLESS of pcenRunningM's value - matching
-   every other STFT_LOG_MODE's own masked-bin handling (a fixed, magnitude-independent output),
-   so no bin-range special-casing is needed here, only in the caller's masking of `magnitude`
-   itself (same as every other mode already does). delta[bin] > 0 always (softplus range) keeps
-   `base` (the argument to the final stftFastPow) strictly positive even when ratio is exactly
-   0, satisfying stftFastPow's own x>0 precondition unconditionally - no epsilon-flooring needed
-   here the way STFT_LOG_EPSILON floors the dB path's log argument. */
+   Every bin (including DC and Nyquist) gets a real, non-special-cased PCEN value - no bins are
+   masked/zeroed anymore (see this file's own git history: an earlier version brick-wall-cut
+   bins below 150Hz to discard wind/handling rumble, matching student_model.py's LogSpectrogram
+   at the time - removed from both sides together). Still safe if magnitude/power is genuinely
+   0 (e.g. true digital silence): ratio is then exactly 0 and the result is exactly
+   delta^r - delta^r == 0, and delta[bin] > 0 always (softplus range) keeps `base` (the argument
+   to the final stftFastPow) strictly positive even then, satisfying stftFastPow's own x>0
+   precondition unconditionally - no epsilon-flooring needed here the way STFT_LOG_EPSILON
+   floors the dB path's log argument. */
 
 static inline float32_t computePcenBin(uint32_t bin, float32_t magnitude) {
 
@@ -3356,11 +3346,11 @@ static void computeSpectrogram(const int16_t *source) {
         /* Bypasses STFT_LOG_MODE entirely - PCEN replaces the whole dB conversion, not just
            one of its variants (matching student_model.py's LogSpectrogram.forward(): in
            normalization="pcen" mode, self.pcen(magnitude) is returned directly, _fast_log10_db
-           is never called at all). Bin 0 (DC) forced to 0 the same way every other mode forces
-           it to a fixed, magnitude-independent floor - see computePcenBin's own docstring for
-           why that's exactly right for PCEN too, not merely a convenient approximation. */
+           is never called at all). Bin 0 (DC) has no imaginary part - CMSIS-DSP packs it into
+           stftFFTOutput[0] (real-valued), same reason the Nyquist bin below reads
+           stftFFTOutput[1] instead of going through the general re/im loop. */
 
-        stftSpectrogramDb[frame][0] = computePcenBin(0, 0.0f);
+        stftSpectrogramDb[frame][0] = computePcenBin(0, fabsf(stftFFTOutput[0]));
 
         stftSpectrogramDb[frame][STFT_FFT_LENGTH / 2] = computePcenBin(STFT_FFT_LENGTH / 2, fabsf(stftFFTOutput[1]));
 
@@ -3370,7 +3360,7 @@ static void computeSpectrogram(const int16_t *source) {
 
             float32_t im = stftFFTOutput[2 * bin + 1];
 
-            float32_t magnitude = (bin < STFT_HIGHPASS_BIN) ? 0.0f : sqrtf(re * re + im * im);
+            float32_t magnitude = sqrtf(re * re + im * im);
 
             stftSpectrogramDb[frame][bin] = computePcenBin(bin, magnitude);
 
@@ -3378,9 +3368,9 @@ static void computeSpectrogram(const int16_t *source) {
 
 #elif STFT_LOG_MODE == STFT_LOG_MODE_LOG10F
 
-        /* Bin 0 (DC, 0Hz) is always below STFT_HIGHPASS_BIN - masked to the epsilon floor, matching student_model.py's LogSpectrogram exactly (magnitude zeroed before the log, not the log output clamped after) */
+        /* Bin 0 (DC, 0Hz) has no imaginary part - see the PCEN branch's own comment above. */
 
-        stftSpectrogramDb[frame][0] = 20.0f * log10f(STFT_LOG_EPSILON);
+        stftSpectrogramDb[frame][0] = 20.0f * log10f(fabsf(stftFFTOutput[0]) + STFT_LOG_EPSILON);
 
         stftSpectrogramDb[frame][STFT_FFT_LENGTH / 2] = 20.0f * log10f(fabsf(stftFFTOutput[1]) + STFT_LOG_EPSILON);
 
@@ -3390,7 +3380,7 @@ static void computeSpectrogram(const int16_t *source) {
 
             float32_t im = stftFFTOutput[2 * bin + 1];
 
-            float32_t magnitude = (bin < STFT_HIGHPASS_BIN) ? 0.0f : sqrtf(re * re + im * im);
+            float32_t magnitude = sqrtf(re * re + im * im);
 
             stftSpectrogramDb[frame][bin] = 20.0f * log10f(magnitude + STFT_LOG_EPSILON);
 
@@ -3398,7 +3388,7 @@ static void computeSpectrogram(const int16_t *source) {
 
 #elif STFT_LOG_MODE == STFT_LOG_MODE_VLOG
 
-        stftMagnitude[0] = STFT_LOG_EPSILON;
+        stftMagnitude[0] = fabsf(stftFFTOutput[0]) + STFT_LOG_EPSILON;
 
         stftMagnitude[STFT_FFT_LENGTH / 2] = fabsf(stftFFTOutput[1]) + STFT_LOG_EPSILON;
 
@@ -3408,7 +3398,7 @@ static void computeSpectrogram(const int16_t *source) {
 
             float32_t im = stftFFTOutput[2 * bin + 1];
 
-            float32_t magnitude = (bin < STFT_HIGHPASS_BIN) ? 0.0f : sqrtf(re * re + im * im);
+            float32_t magnitude = sqrtf(re * re + im * im);
 
             stftMagnitude[bin] = magnitude + STFT_LOG_EPSILON;
 
@@ -3426,7 +3416,9 @@ static void computeSpectrogram(const int16_t *source) {
 
 #elif STFT_LOG_MODE == STFT_LOG_MODE_LOG10_FIXED
 
-        stftSpectrogramDb[frame][0] = 20.0f * stftFastLog10(STFT_LOG_EPSILON);
+        /* Bin 0 (DC, 0Hz) has no imaginary part - see the PCEN branch's own comment above. */
+
+        stftSpectrogramDb[frame][0] = 20.0f * stftFastLog10(fabsf(stftFFTOutput[0]) + STFT_LOG_EPSILON);
 
         stftSpectrogramDb[frame][STFT_FFT_LENGTH / 2] = 20.0f * stftFastLog10(fabsf(stftFFTOutput[1]) + STFT_LOG_EPSILON);
 
@@ -3436,7 +3428,7 @@ static void computeSpectrogram(const int16_t *source) {
 
             float32_t im = stftFFTOutput[2 * bin + 1];
 
-            float32_t magnitude = (bin < STFT_HIGHPASS_BIN) ? 0.0f : sqrtf(re * re + im * im);
+            float32_t magnitude = sqrtf(re * re + im * im);
 
             stftSpectrogramDb[frame][bin] = 20.0f * stftFastLog10(magnitude + STFT_LOG_EPSILON);
 
