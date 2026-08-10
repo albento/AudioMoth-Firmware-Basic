@@ -23,7 +23,7 @@
    exclusive with TRIGGERED_RECORDING_MODE below - only one of the two may be 1 at a time
    (see the #error guard just below). */
 
-#define STFT_DEBUG_MODE                          0
+#define STFT_DEBUG_MODE                          1
 
 /* Continuously listens and runs the on-device INT8 classifier (model_inference.c) every
    64ms buffer; whenever its output crosses TRIGGER_PROBABILITY_THRESHOLD, records a new WAV
@@ -32,7 +32,7 @@
    runTriggeredRecording(). See GUIDE_REIMPLEMENTATION.md for the STFT/model pipeline this
    reuses, and the plan this was built from for the full design rationale. */
 
-#define TRIGGERED_RECORDING_MODE                 1
+#define TRIGGERED_RECORDING_MODE                 0
 
 #if STFT_DEBUG_MODE && TRIGGERED_RECORDING_MODE
 #error "STFT_DEBUG_MODE and TRIGGERED_RECORDING_MODE are mutually exclusive - set at most one to 1"
@@ -46,9 +46,16 @@
    completely untouched by this, in this mode and every other. See
    test-audiomoth-cnn/student_model.py's _AlibiEncoderLayer/_AlibiSelfAttention for the
    reference this ports, and this section's own comment further below for the full design
-   rationale. */
+   rationale.
 
-#define STFT_DEBUG_ATTENTION_TEST                1
+   Set to 0 here (test-audiomoth-cnn/compare_device_output.py capture): this test's whole
+   point is a clean, gap-free BINARY capture of the real classifier's own logit, carried
+   continuously buffer to buffer - the attention probe's own extra per-buffer work (already
+   ~1.18x the 64ms budget on its own, per this session's own design discussion) risks DMA
+   buffer overruns/dropped buffers, which would break the LSTM state continuity
+   compare_device_output.py depends on. */
+
+#define STFT_DEBUG_ATTENTION_TEST                0
 
 #if STFT_DEBUG_MODE || TRIGGERED_RECORDING_MODE
 #include "arm_math.h"
@@ -2989,7 +2996,7 @@ inline void AudioMoth_handleSwitchInterrupt() {
 #define STFT_OUTPUT_MODE_CSV                      0
 #define STFT_OUTPUT_MODE_BINARY                   1
 
-#define STFT_OUTPUT_MODE                          STFT_OUTPUT_MODE_CSV
+#define STFT_OUTPUT_MODE                          STFT_OUTPUT_MODE_BINARY
 
 #if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
 #define STFT_DATA_FILENAME                        "STFT_DATA_" STFT_MODE_SUFFIX ".BIN"
@@ -4304,7 +4311,7 @@ static void runSTFTFeasibilityTest(void) {
    pcen.h are re-exported from a different checkpoint - this is per-checkpoint, not a fixed
    constant. */
 
-#define TRIGGER_PROBABILITY_THRESHOLD              0.6747f
+#define TRIGGER_PROBABILITY_THRESHOLD              0.8f
 
 /* logit(p) = ln(p/(1-p)), the inverse of sigmoid - see TRIGGER_PROBABILITY_THRESHOLD's
    comment above. Computed once in runTriggeredRecording()'s init, not a compile-time
