@@ -23,7 +23,7 @@
    exclusive with TRIGGERED_RECORDING_MODE below - only one of the two may be 1 at a time
    (see the #error guard just below). */
 
-#define STFT_DEBUG_MODE                          1
+#define STFT_DEBUG_MODE                          0
 
 /* Continuously listens and runs the on-device INT8 classifier (model_inference.c) every
    64ms buffer; whenever its output crosses TRIGGER_PROBABILITY_THRESHOLD, records a new WAV
@@ -32,7 +32,7 @@
    runTriggeredRecording(). See GUIDE_REIMPLEMENTATION.md for the STFT/model pipeline this
    reuses, and the plan this was built from for the full design rationale. */
 
-#define TRIGGERED_RECORDING_MODE                 0
+#define TRIGGERED_RECORDING_MODE                 1
 
 #if STFT_DEBUG_MODE && TRIGGERED_RECORDING_MODE
 #error "STFT_DEBUG_MODE and TRIGGERED_RECORDING_MODE are mutually exclusive - set at most one to 1"
@@ -4294,7 +4294,17 @@ static void runSTFTFeasibilityTest(void) {
    equivalent raw-logit threshold a single time and comparing the raw logit against that
    (monotonic with sigmoid, so equivalent) costs nothing per buffer. */
 
-#define TRIGGER_PROBABILITY_THRESHOLD              0.2f
+/* 0.6747 - precision-at-recall>=95% threshold from export_int8.py --long-clips's real INT8
+   evaluation of student_windowed_lstm_lstm_16_32_64_h64_pcen.pt (100 calibration clips, 20
+   test clips, --calibration-percentile 99.9: float32 96.7% frame AP, real INT8 96.0% - the
+   default max-based calibration gave only 87.1% (a real, since-diagnosed issue: PCEN's rare
+   "attack overshoot" transients set an abs_max ~100x its typical range, wasting int8
+   resolution on values that occur in well under 0.1% of frames - see this session's own
+   design discussion/export_int8.py's own calibrate() docstring). Re-tune whenever model.h/
+   pcen.h are re-exported from a different checkpoint - this is per-checkpoint, not a fixed
+   constant. */
+
+#define TRIGGER_PROBABILITY_THRESHOLD              0.6747f
 
 /* logit(p) = ln(p/(1-p)), the inverse of sigmoid - see TRIGGER_PROBABILITY_THRESHOLD's
    comment above. Computed once in runTriggeredRecording()'s init, not a compile-time

@@ -6,12 +6,7 @@
  * must equal main.c's STFT_NUMBER_OF_BINS), consumed by main.c's
  * STFT_NORMALIZATION_PCEN (see stftFastPow/computeSpectrogram there). Regenerate this
  * file (do not hand-edit) whenever the underlying checkpoint changes - do not mix
- * pcen.h/pcen.c from one checkpoint with model.h/model.c from another.
- *
- * Exported from distill/student_cnn_lstm_small_64_learned_pcen.pt (50000x2 training clips,
- * hidden=64, pos-weight) - test-set results: clip AP 99.2%/P@R95 97.7%, frame AP 92.4%/
- * P@R95 69.1%. Must be paired with a model.h/model.c exported from the SAME checkpoint
- * (--channels 16,32,64 --lstm-hidden-size 64). */
+ * pcen.h/pcen.c from one checkpoint with model.h/model.c from another. */
 
 #define MODEL_PCEN_NUMBER_OF_BINS 129
 #define MODEL_PCEN_EPS 1.0000000000e-06f
