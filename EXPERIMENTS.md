@@ -750,13 +750,18 @@ is flashable with real (non-placeholder) `pcen.h`/`pcen.c`.
 ### Still needed before this is actually deployable
 
 1. ~~Regenerate `model/pcen.h`/`pcen.c` for real~~ - done (see above).
-2. **Real hardware timing** (see above) - the op-count estimate is not a substitute.
-3. **Device-vs-PC numerical parity check**, the same rigor as the EMA/log10 path already got
-   (see "Device-vs-PC numerical parity" above) - `compare_device_output.py` does not yet know
-   about PCEN mode at all; extending it (or a PCEN-specific equivalent) to replay
-   `stftFastPow`/`computePcenBin`'s exact fixed-point arithmetic in Python and compare against
-   a real on-device capture has not been done, only the Python-side bit-trick simulation vs
-   exact float64 PCEN (above).
+2. ~~Real hardware timing~~ - done, indirectly: "Triggered recording" below's real-hardware
+   budget check (~59%/71% of 64ms) runs the full STFT+PCEN+model pipeline on real hardware,
+   PCEN included (it's the compiled-in normalization for that build) - not a PCEN-isolated
+   number, but confirms the whole pipeline (PCEN's own cost included) has real headroom.
+3. ~~Device-vs-PC numerical parity check~~ - done: `compare_device_output.py --long-clips`
+   (see "Post-PCEN-deployment findings" below) now rebuilds the exact `QuantizedModel`
+   (channels/hidden_size/calibration-percentile all threaded through) and replays a real
+   on-device BINARY capture against `int8_sim.py` for a PCEN/long-clip checkpoint. Result:
+   device tracks the simulator closely (small, if slightly growing, residual - see below), but
+   both drift substantially from the float32 reference over a long continuous capture - a
+   separate, not-yet-fully-understood finding (see below), not the parity gap this item was
+   originally about.
 
 ## ViT attention-layer compute-cost probe (`STFT_DEBUG_ATTENTION_TEST`)
 
@@ -902,3 +907,148 @@ narrower FFN expansion), not a firmware rewrite - it needs to be validated on th
 first (does `student_cnn_vit_alibi_pcen`-style TinyViT hold onto its accuracy with
 `ffn_ratio=2`?) before any more firmware time goes into it. Recommended next step for
 `test-audiomoth-cnn`, not `AudioMoth-Firmware-Basic`.
+
+## Post-PCEN-deployment findings (long-clip/TBPTT training, INT8 calibration, real-world mismatch)
+
+Everything below happened after the PCEN deployment/ViT probe work above, mostly on the
+`test-audiomoth-cnn` side, but with real consequences for this repo's own `model.h`/`model.c`/
+`pcen.h`/`pcen.c`/`main.c`. See `GUIDE_REIMPLEMENTATION.md`'s §6/§14.5/§16 for the reference-doc
+version of the two most important findings here.
+
+### Highpass mask removed, then reinstated - a real cause found, not just reverted on a hunch
+
+The `<150Hz` highpass mask (`STFT_HIGHPASS_BIN`, both `student_model.py`'s `LogSpectrogram` and
+`main.c`'s `computeSpectrogram()`) was removed entirely on the reasoning that the 150Hz cutoff
+was somewhat arbitrary. Real cost, found afterward on a trained checkpoint: threshold >0.95
+needed to separate speech from background on a real recording, where <0.5 sufficed before.
+Ablation (masking the same 3 bins post-hoc, same trained weights, no retraining) roughly
+doubled the fraction of frames scoring confidently near-zero (32.8% -> 58.6%) - these bins
+carry large, mostly non-informative energy (DC offset, wind/handling rumble) a small model
+struggles to learn to discount. Reinstated in both `student_model.py` and `main.c` (a clean
+`git revert` on the firmware side, since it was an isolated commit).
+
+Real bug found and fixed while reinstating it on the firmware side: bin 0 (DC, packed
+separately into `stftFFTOutput[0]` by `arm_rfft_fast_f32`) was hardcoded to the masked/epsilon
+floor in all four `STFT_LOG_MODE`/PCEN branches instead of computing its real value - fixed to
+use `fabsf(stftFFTOutput[0])` like the Nyquist bin already did.
+
+**Verified after the fact - the checkpoint blamed for needing threshold >0.95 was not actually
+missing this mask at training time.** PCEN's own learned per-band `alpha` for bins 0-2 turned
+out to be bit-for-bit IDENTICAL across all three bins (`0.613351941108704`, to full float
+precision) while every other bin's value is unique - the exact signature of a bin that received
+zero real gradient the whole time (PCEN's own math makes a masked bin's output exactly
+`delta^r-delta^r=0` for any params, so only AdamW's weight decay - identical for identically-
+initialized, identically-treated params - can move it, deterministically the same for every
+masked bin). This checkpoint was trained WITH the mask present (its cluster's cluster training
+run on a separate machine, code state not tracked by this repo's own commit history) - the
+>0.95 threshold symptom was actually a testing artifact (evaluating with a code version that
+had briefly removed the mask, mismatched against what the checkpoint was actually trained on),
+not evidence the checkpoint itself needed the mask added. The mask was still worth reinstating
+as a forward-looking design choice - just not for the reason first assumed.
+
+### LSTM h64 embedded in `TRIGGERED_RECORDING_MODE` - real INT8 export results
+
+`model.h`/`model.c`/`pcen.h`/`pcen.c` now hold a real export of
+`student_windowed_lstm_lstm_16_32_64_h64_pcen.pt` (`train_windowed.py`'s windowed/TBPTT
+training, channels 16/32/64, LSTM hidden=64, PCEN) via `export_int8.py --long-clips`/
+`export_pcen.py --long-clips` (new flags - `test-audiomoth-cnn` didn't have a way to export a
+`train_windowed.py` checkpoint before this; `export_int8.py`/`export_pcen.py` only knew
+`train_student.py`'s short-clip convention). `main.c` switched `STFT_DEBUG_MODE` 1->0,
+`TRIGGERED_RECORDING_MODE` 0->1 - this is the first time this repo has shipped a real trained
+model in the actual deployment mode, not just a debug/timing build.
+
+First export attempt (default max-based calibration): real INT8 87.1% frame AP vs float32's
+96.7% - see "Calibrating on a percentile, not the max" below for the real cause and fix (96.0%
+after the fix). `TRIGGER_PROBABILITY_THRESHOLD` set to the precision-at-recall>=95% value from
+that export's own PR curve (0.6747 initially, 0.6756 after a later re-export) - not a fixed
+constant, re-measure whenever `model.h`/`pcen.h` are re-exported from a different checkpoint.
+
+### Calibrating INT8 on a percentile, not the literal max - PCEN's heavy-tailed output
+
+Root cause of the 87.1%-vs-96.7% gap above: PCEN's rare "attack overshoot" (output spikes when
+its slow running-average `M` lags a sudden onset) sets the true `abs_max` ~100-300x the typical
+activation range, in well under 0.1% of frames on real calibration data (median 22, p90 111,
+p99 318, max 6704). Calibrating INT8's scale on that literal max (the only option before this)
+wastes nearly all of int8's resolution on values that occur almost never, crushing the
+genuinely informative range into a handful of int8 levels.
+
+Fixed with a new `--calibration-percentile` flag on `export_int8.py` (default 100 = unchanged
+literal-max behavior; PCEN checkpoints want e.g. 99.9). Real result on the h64 checkpoint: INT8
+frame AP 87.1% -> 96.0% (float32 is 96.7%), precision-at-recall>=95% 62.1% -> 83.0%, for one
+flag. Percentile calibration can't just track a running scalar like `max()` does - it needs a
+real (random, seeded - `CALIBRATION_SAMPLE_SEED` - not the default global RNG, or two
+calibrations of the same checkpoint silently produce different, non-reproducible scales, a real
+instance of which briefly looked like a firmware bug during device-vs-PC comparison below)
+sample of the whole calibration set's distribution, bounded in memory via a per-clip subsample
+cap (`PER_CLIP_SAMPLE_CAP`) rather than accumulating every value verbatim.
+
+### Device-vs-simulator comparison, extended for PCEN/long clips - real hardware capture
+
+`compare_device_output.py` gained `--long-clips`/`--dataset-dir`/`--checkpoint`/
+`--calibration-percentile` (mirroring `export_int8.py`'s own) so it can rebuild the exact
+`QuantizedModel` a `--long-clips` export produced. Also fixed a real, pre-existing bug this
+needed anyway: it never called `load_learned_pcen()` on its own freshly-built `LogSpectrogram`,
+so every PCEN checkpoint was silently being rebuilt/calibrated against PCEN's untrained
+literature-default init, not the checkpoint's own learned values - `export_int8.py` already had
+this right, `compare_device_output.py` just hadn't been touched since before PCEN existed.
+
+Real capture (`main.c` temporarily switched to `STFT_DEBUG_MODE=1`/
+`STFT_OUTPUT_MODE=STFT_OUTPUT_MODE_BINARY`/`STFT_DEBUG_ATTENTION_TEST=0`,
+`TRIGGERED_RECORDING_MODE=0` - mutually exclusive, and the attention probe's own extra
+per-buffer cost risked dropped buffers/broken LSTM continuity for this specific test), 414
+buffers, no gaps: device vs `int8_sim.py` mean |diff| 0.43, correlation 0.965, growing over the
+recording (thirds: 0.13/0.44/0.71) - by itself, flagged by the tool's own heuristic as a
+possible real accumulating bug. Cross-checked against the float32 reference on the same
+buffers: **both device and `int8_sim.py` diverge from float32 by a similarly large, similarly
+growing amount** (int8_sim vs float32: 2.2/3.6/6.5 by thirds; device vs float32: 2.2/3.8/6.0) -
+much larger than the device-vs-simulator gap itself. Conclusion: the growth is dominated by an
+apparently inherent property of int8-quantized recurrent LSTM state drifting from its float
+reference over a long (~26s), never-reset sequence, shared by the device and the simulator
+alike - not a device-specific firmware bug. The smaller residual device-vs-simulator growth is
+real and not fully explained (plausibly the sigmoid/tanh float-vs-LUT approximation compounding
+a little through the recurrence) but is proportionally minor next to the int8-vs-float
+component.
+
+### The most serious bug of this whole project: EMA gain applied before PCEN at training time, never at real inference
+
+Found from a real-world observation, not a code review: the user reported the model performing
+much better on synthetic LibriSpeech-based test clips than on real test files or a real
+AudioMoth, and - a stronger signal - that the very first LSTM checkpoints (no PCEN, no windowed
+training, none of this session's work) generalized to real AudioMoth recordings *better* than
+the latest one despite lacking every optimization added since.
+
+Root cause: `train_student.py::DistillationDataset` has always correctly gated
+`streaming_rms_normalize()` (the EMA/AGC waveform-domain gain) behind `if NORMALIZATION_MODE ==
+"ema":`, with its own documented reasoning (applying it before PCEN double-normalizes, and PCEN
+needs the waveform's real dynamic range) - matching the real firmware, where
+`computeBufferGain()` returns a fixed `1.0f` in PCEN mode, no waveform-domain gain at all.
+`train_windowed.py::_prepare_clip_waveform` (used by `LongClipDataset`/`ParquetLongClipDataset`,
+and therefore by every checkpoint in the architecture sweep - h16/h32/h64/vit_e32/e48/e64) had
+no such gate at all - applied the gain unconditionally, an oversight from when PCEN support was
+added to that script, not a deliberate choice.
+
+Verified directly on a real recording (`test3.wav`) with the h64/PCEN checkpoint: real-inference
+path (raw waveform -> PCEN, what `predict_timeline.py`/the firmware actually do) gives median
+P(positive) 0.055, 9.5% of frames >0.5; the training-matched path (AGC-leveled -> PCEN, the bug)
+gives median 0.292, 28.9% of frames >0.5 - correlation only 0.75 between the two. The model's
+learned calibration is fit to a waveform distribution real inference never actually presents it
+with.
+
+Fixed by adding the same gate `_prepare_clip_waveform` should have had from the start. No
+re-export can fix an already-trained checkpoint - **every existing PCEN checkpoint from
+`train_windowed.py` needs retraining under the fix before being trusted on real audio**; this
+was a training-time bug, invalidating this session's own earlier real-world-readiness claims
+for the h64 checkpoint (the INT8/calibration/device-comparison work above remains valid as
+*methodology*, just needs re-running against a correctly-retrained checkpoint).
+
+### Loss calibration: `--pos-weight` and general output compression toward high values
+
+Separate, not yet root-caused: models trained with `--pos-weight` (computed from the balanced-
+regime synthetic dataset's own ~22.6% average occupancy, itself an artifact of deliberately
+balancing regime representation per split rather than matching real-world prevalence) show
+compressed output - speech confidently >0.95, but background sitting around ~0.5 instead of
+near 0, leaving little room to widen the gap further. Leading hypothesis: `--pos-weight` biases
+the loss enough, on a capacity-limited model, to shift the whole output distribution upward
+rather than sharpening separation - to be tested by retraining without `--pos-weight`, and/or
+with `--focal-gamma` instead, once the bug above is fixed (no point tuning this on top of a
+known-mismatched training pipeline). Not yet resolved as of this entry.

@@ -1,17 +1,23 @@
 # Guide de réimplémentation : STFT + classifieur INT8 (CMSIS-DSP/CMSIS-NN) sur AudioMoth
 
 Ce document rassemble tout ce qu'il faut savoir pour ré-implémenter, seul et en comprenant
-chaque brique, le pipeline actuel : capture audio -> STFT -> normalisation -> modèle
-`TinyLSTMCNN` quantifié en INT8 -> classification, sur le AudioMoth Dev
-(EFM32WG380F256, Cortex-M4F @ 48MHz, 256KB flash, 32KB RAM interne + 256KB SRAM externe).
+chaque brique, le pipeline actuel : capture audio -> STFT -> normalisation (EMA ou PCEN,
+voir §4/§6 - **PCEN est le choix actuellement déployé**) -> modèle `TinyLSTMCNN` quantifié en
+INT8 -> classification, sur le AudioMoth Dev (EFM32WG380F256, Cortex-M4F @ 48MHz, 256KB flash,
+32KB RAM interne + 256KB SRAM externe), dans l'un de trois modes firmware mutuellement
+exclusifs (`STFT_DEBUG_MODE`, `TRIGGERED_RECORDING_MODE` - le mode de déploiement réel, voir
+§15 -, ou le firmware normal) - voir `src/main.c`, tout en haut du fichier.
 
 Il part du principe que vous ne connaissez pas CMSIS-DSP/CMSIS-NN, et détaille en particulier
 les optimisations de convolution et les problèmes rencontrés avec la couche LSTM, qui ont été
-la source du bug le plus sérieux de toute l'investigation.
+longtemps la source du bug le plus sérieux de toute l'investigation - jusqu'à ce qu'un bug de
+parité entraînement/déploiement encore plus important (§14.5) soit trouvé plus tard.
 
 Sources citées : `src/main.c`, `src/model_inference.c` (ce dépôt), `export_int8.py`,
-`int8_sim.py`, `student_model.py`, `dataset.py` (`test-audiomoth-cnn`), et le code source de
-CMSIS-NN lui-même (`AudioMoth-Project/CMSIS-NN/Source/...`).
+`export_pcen.py`, `compare_device_output.py`, `int8_sim.py`, `student_model.py`,
+`train_windowed.py`, `dataset.py` (`test-audiomoth-cnn`), et le code source de CMSIS-NN
+lui-même (`AudioMoth-Project/CMSIS-NN/Source/...`). Pour l'historique chronologique complet des
+expériences (pas seulement le guide de réimplémentation), voir `EXPERIMENTS.md`.
 
 ---
 
@@ -20,9 +26,11 @@ CMSIS-NN lui-même (`AudioMoth-Project/CMSIS-NN/Source/...`).
 ```
 Microphone (ADC, 16kHz, int16 brut)
   -> buffer de 1024 échantillons (64ms), un par interruption DMA
-  -> gain RMS glissant (normalisation causale)
-  -> fenêtrage de Hann + FFT 256 points -> magnitude -> log10 (approx. fixe)
-  -> masquage des bins < 150Hz (passe-haut)
+  -> [mode EMA] gain RMS glissant (normalisation causale, waveform-domain, §4)
+  -> fenêtrage de Hann + FFT 256 points -> magnitude
+  -> masquage des bins < 150Hz (passe-haut, §5)
+  -> [mode EMA/NONE] log10 (approx. fixe) ; [mode PCEN, déployé actuellement] compression PCEN
+     par bin (§6), sur la magnitude - pas de log du tout, pas de gain waveform-domain en amont
   -> spectrogramme [7 frames x 129 bins] pour ce buffer
   -> quantification en int8
   -> 5 étages de convolution (CNN séparable en profondeur) -> [64 canaux, T'=1]
@@ -35,6 +43,14 @@ Le point clé architectural : avec ce modèle, chaque buffer de 64ms produit **e
 logit (les 3 étages à stride 2 réduisent le temps 7 -> 1). C'est ce qui permet un vrai
 streaming : un pas de LSTM par buffer, état conservé, jamais réinitialisé pendant tout
 l'enregistrement.
+
+`STFT_NORMALIZATION_MODE` (`main.c`) choisit EMA/NONE/PCEN à la compilation - un seul mode
+compilé à la fois, pas un choix runtime. **PCEN est le mode réellement déployé aujourd'hui**
+(voir §6) ; EMA reste documenté (§4) car c'est le schéma historique, plus simple, et sert de
+comparaison. Le piège de parité le plus grave rencontré sur ce projet (§14.5) vient précisément
+d'un endroit où le code d'entraînement appliquait encore le gain EMA **avant** PCEN alors que
+le firmware ne le fait jamais dans ce mode - lisez §6 et §14.5 ensemble avant de toucher à la
+normalisation.
 
 ---
 
@@ -132,6 +148,15 @@ reproduit exactement le découpage par buffer (voir le code, `buffer_samples=102
 
 ## 4. Normalisation RMS glissante (causale)
 
+**Cette section décrit `STFT_NORMALIZATION_EMA` - pas le mode actuellement déployé (`PCEN`,
+§6).** Gardée en détail parce que le mécanisme (gain causal buffer par buffer) et ses pièges
+(jitter de calibration non-seedé, notamment) restent pertinents ailleurs dans le pipeline, et
+parce qu'EMA reste une comparaison utile. **Le gain décrit ici ne s'applique JAMAIS en mode
+PCEN** - `computeBufferGain()` y retourne un `1.0f` fixe (voir §6) ; l'avoir appliqué quand même
+côté entraînement, dans un chemin de code qui a oublié cette exclusion, est le bug de parité le
+plus grave rencontré sur ce projet (§14.5) - lisez cette section avant de modifier quoi que ce
+soit ici.
+
 Le modèle a besoin d'un niveau de signal à peu près stable pour bien fonctionner. Faire ça sur
 tout un clip (RMS du clip entier) n'est pas possible en temps réel (il faudrait connaître le
 futur). La solution causale : une moyenne exponentielle (EMA) de la puissance moyenne
@@ -180,7 +205,79 @@ bins 0/1/2 sont masqués. Le masquage doit se faire sur la magnitude, pas sur le
 
 ---
 
-## 6. Le modèle : TinyLSTMCNN
+## 6. Normalisation PCEN (`STFT_NORMALIZATION_PCEN`, mode actuellement déployé)
+
+Alternative à la normalisation EMA (§4) : au lieu d'un gain global appliqué au waveform avant
+la FFT, PCEN (Per-Channel Energy Normalization, Wang et al. 2017) compresse **après** la FFT,
+**par bin de fréquence**, avec des paramètres appris (pas fixes) :
+
+```
+M[t] = (1-ema_alpha)*M[t-1] + ema_alpha*E[t]      // moyenne mobile causale de la puissance, par bin
+pcen = (E[t]/(M[t]+eps)^alpha + delta)^r - delta^r
+```
+
+`alpha`, `delta`, `r`, `ema_alpha` sont appris **par bin** (129 valeurs chacun) pendant
+l'entraînement (`student_model.py::LearnablePCEN`), pas une seule constante partagée. `M`
+(l'estimation causale de puissance) est un état **persistant par bin**, jamais réinitialisé en
+cours d'enregistrement - l'équivalent PCEN de `stftRunningMeanSq` de la §4, mais un scalaire par
+bin plutôt qu'un seul scalaire global.
+
+**Aucun gain waveform-domain en amont** : `computeBufferGain()` retourne un `1.0f` fixe en mode
+PCEN, exactement comme en mode `NONE` - toute l'adaptation se fait après la FFT, sur la
+magnitude par bin, pas avant. C'est déjà ce que fait `student_model.py` côté entraînement
+(`NORMALIZATION_MODE=pcen` saute `streaming_rms_normalize()` entièrement) - **sauf dans un
+chemin de code précis qui a longtemps fait l'inverse, le bug de parité le plus grave rencontré
+sur ce projet, voir §14.5**.
+
+Les bins masqués (§5) n'ont besoin d'aucun cas particulier : PCEN d'une entrée toujours nulle
+vaut toujours exactement `delta^r - delta^r == 0`, quels que soient les paramètres appris ou
+l'état de `M` - la même propriété "sortie fixe, indépendante de la magnitude" que chaque autre
+variante de `STFT_LOG_MODE` exploite déjà pour ces bins.
+
+### Approximation numérique : `stftFastPow`, pas juste `stftFastLog10`
+
+`alpha` et `r` sont des exposants fractionnaires **appris par bin**, pas un exposant fixe -
+`stftFastLog10` (bit-trick IEEE-754, réutilisé pour le mode EMA/log) ne suffit plus tel quel.
+`stftFastPow(x, a) = exp2(a * log2(x))` réutilise le même bit-trick (`stftFastLog2Q16_16()`,
+même constante de biais) et ajoute son inverse algébrique (`stftFastExp2Q16_16()`) - même
+qualité d'approximation déjà validée pour `stftFastLog10` (~0.26dB / ~3% pire cas), pas un
+nouveau schéma numérique. Validé de bout en bout contre PCEN exact en float64 sur un
+enregistrement réel : erreur absolue moyenne 0.052, p99 0.135, sur une plage de sortie PCEN
+d'environ 0-14.
+
+### Calibration INT8 : calibrer sur un percentile, pas le max littéral
+
+PCEN produit une distribution de sortie à **queue très lourde** : sur un vrai jeu de
+calibration, médiane ~22, p90 ~111, p99 ~318, mais le **max** atteint ~6700 - plus de 200x la
+médiane, dans bien moins de 0.1% des frames (un "attack overshoot" : quand `M` (lent) n'a pas
+encore rattrapé un son fort qui vient de démarrer, le ratio `E/M^alpha` explose transitoirement
+avant que `M` ne remonte). Calibrer l'échelle INT8 sur ce max littéral (`export_int8.py`,
+comportement par défaut, `--calibration-percentile 100`) gaspille presque toute la résolution
+INT8 sur des valeurs qui n'arrivent presque jamais, écrasant la plage réellement informative
+(médiane/p90) dans une poignée de niveaux sur 256.
+
+Mesuré sur `student_windowed_lstm_lstm_16_32_64_h64_pcen.pt` : calibration sur le max -> AP
+frame INT8 réel 87.1% contre 96.7% en float32 (delta -9.6%, stable de 40 à 100 clips de
+calibration, donc pas un artefact d'échantillon). Calibration sur le p99.9
+(`--calibration-percentile 99.9`) -> AP INT8 96.0% (delta -0.8%), précision à rappel≥95% 62.1%
+-> 83.0%. Un gain massif pour un seul flag - voir `export_int8.py --long-clips
+--calibration-percentile 99.9` (et son propre docstring `calibrate()`/`calibrate_long()` pour
+l'implémentation : échantillonnage aléatoire **seedé** - `CALIBRATION_SAMPLE_SEED` - pas le RNG
+global, pour que deux calibrations du même checkpoint restent reproductibles bit à bit, même
+piège que celui déjà documenté en §4/§14.5).
+
+`compare_device_output.py --long-clips` (mêmes flags qu'`export_int8.py`) rejoue une capture
+réelle du device contre `int8_sim.py` pour un checkpoint PCEN/clips longs - corrige au passage
+un bug préexistant (le rebuild du `QuantizedModel` n'appelait jamais `load_learned_pcen()`,
+donc calibrait silencieusement contre l'init PCEN non entraînée). Résultat réel obtenu : bonne
+corrélation device/simulateur (le vrai firmware suit fidèlement `int8_sim.py`), mais tous deux
+dérivent progressivement du modèle float32 sur une séquence continue longue (~26s, 414 buffers
+sans reset) - une propriété apparemment inhérente à l'état récurrent LSTM en précision réduite
+sur une longue séquence, partagée par le device et la simulation, pas un bug firmware isolé.
+
+---
+
+## 7. Le modèle : TinyLSTMCNN
 
 Architecture (`student_model.py::TinyLSTMCNN`, canaux 16/32/64, LSTM hidden=16) :
 
@@ -192,7 +289,7 @@ Architecture (`student_model.py::TinyLSTMCNN`, canaux 16/32/64, LSTM hidden=16) 
 | stage2_dw | depthwise | 32 | 32 | 3x3 | 2 | 1 | 32 |
 | stage2_pw | pointwise 1x1 | 32 | 64 | 1x1 | 1 | 0 | 1 |
 
-Chaque conv est suivie de BatchNorm (fusionné dans les poids avant quantification, voir §8) et
+Chaque conv est suivie de BatchNorm (fusionné dans les poids avant quantification, voir §9) et
 ReLU. Avec l'entrée `[1, 129, 7]` (fréquence x temps), les 3 étages à stride 2 réduisent le
 temps `7 -> 4 -> 2 -> 1` : **un seul pas de temps en sortie par buffer**.
 
@@ -202,7 +299,7 @@ temps) -> LSTM à une couche (`nn.LSTM(64, 16, batch_first=True)`) -> classifieu
 
 ---
 
-## 7. Quantification INT8 : les notions de base
+## 8. Quantification INT8 : les notions de base
 
 Toute cette section est indépendante de CMSIS-NN - ce sont les conventions génériques de
 quantification "affine" utilisées par TFLite et reprises telles quelles par CMSIS-NN.
@@ -272,11 +369,11 @@ Le biais d'une conv/linéaire est quantifié dans le domaine de l'accumulateur *
 requantization : `bias_q = round(bias_float / (input_scale * weight_scale))`, ajouté à
 l'accumulateur int32 avant l'appel à `arm_nn_requantize`. C'est la convention standard
 TFLite/CMSIS-NN, reprise partout dans ce projet (`export_int8.py::quantize()` pour les conv,
-voir §10 pour le cas particulier - et piégeux - du LSTM).
+voir §11 pour le cas particulier - et piégeux - du LSTM).
 
 ---
 
-## 8. CMSIS-NN : conventions et fonctions de convolution
+## 9. CMSIS-NN : conventions et fonctions de convolution
 
 CMSIS-NN est la bibliothèque ARM de kernels de réseaux de neurones quantifiés (int8, et int16
 pour certaines variantes), optimisée pour les cœurs Cortex-M (SIMD 16 bits type SMLAD sur
@@ -301,7 +398,7 @@ logique de quantification *dans* CMSIS-NN elle-même - c'est à vous de la faire
   (`activation.min`/`activation.max`, ex. `[0, 127]` pour fusionner un ReLU directement dans la
   requantization).
 - `cmsis_nn_per_channel_quant_params` : `{ int32_t *multiplier; int32_t *shift; }` - un
-  multiplicateur/shift par canal de sortie (voir §7.3).
+  multiplicateur/shift par canal de sortie (voir §8.3).
 
 ### 8.2 `arm_convolve_s8` : convolution générale, et le piège de l'im2col
 
@@ -327,13 +424,13 @@ précis (`in_ch=1`), lisant les 9 valeurs du noyau directement dans le tenseur d
 buffer im2col du tout. Ceci n'est possible/correct **que parce que `input_offset` (le
 zero-point d'entrée) est 0** dans tout ce modèle - une position de padding contribue alors
 `0 * poids = 0` à la somme, qu'on peut simplement *sauter* au lieu de la mettre à zéro
-explicitement (voir §11.3 pour le code). Ne faites jamais ça si votre modèle a un
+explicitement (voir §12.3 pour le code). Ne faites jamais ça si votre modèle a un
 `input_offset` non nul (asymétrique) : il faudrait alors ajouter `input_offset * poids` pour
 chaque tap manquant, ce qui annule tout le bénéfice.
 
 Pour les 2 étages "pointwise" (1x1, stride 1, pad 0), im2col ne fait presque rien (une fenêtre
 1x1 = juste le pixel lui-même, pas de gather réel) donc `arm_convolve_s8` reste la meilleure
-option mesurée ici - voir §11 pour la tentative avortée de le remplacer.
+option mesurée ici - voir §12 pour la tentative avortée de le remplacer.
 
 ### 8.3 `arm_depthwise_conv_s8` vs `arm_depthwise_conv_s8_opt`
 
@@ -395,7 +492,7 @@ de toute façon être reconvertie en flottant pour la sigmoïde. Voir `runClassi
 
 ---
 
-## 9. Organisation mémoire des tenseurs d'activation
+## 10. Organisation mémoire des tenseurs d'activation
 
 Le plus gros tenseur intermédiaire (sortie de `stage0`, `16 canaux * 65 * 4 = 4160 octets`) ne
 rentre pas dans la RAM interne déjà largement occupée par le reste du firmware (~4-5KB
@@ -406,7 +503,7 @@ valeurs) restent en RAM interne (rapide, petits).
 
 ---
 
-## 10. Les couches LSTM CMSIS-NN : LE point sensible
+## 11. Les couches LSTM CMSIS-NN : LE point sensible
 
 C'est ici qu'a eu lieu le bug le plus sérieux de toute l'investigation (biais silencieusement
 faux sur chaque pas de LSTM, chaque buffer) - cette section mérite d'être lue attentivement
@@ -419,8 +516,8 @@ Un LSTM a 4 "portes" (forget, input, cell, output), chacune calculée comme :
 (forget/input/output) ou tanh (cell). CMSIS-NN représente ça avec :
 
 - `cmsis_nn_lstm_gate` (une instance par porte) : poids input/hidden (int8), multiplicateurs/
-  shifts (scalaires, **quantification par tenseur**, voir §7.2), type d'activation, et - point
-  crucial - `bias` **et** `input_effective_bias`/`hidden_effective_bias` (voir §10.3).
+  shifts (scalaires, **quantification par tenseur**, voir §8.2), type d'activation, et - point
+  crucial - `bias` **et** `input_effective_bias`/`hidden_effective_bias` (voir §11.3).
 - `cmsis_nn_lstm_params` : dimensions (`input_size`, `hidden_size`, `batch_size`,
   `time_steps`), les 4 `cmsis_nn_lstm_gate`, plus les paramètres propres à la mise à jour de
   l'état cellule (`forget_to_cell_multiplier/shift`, `input_to_cell_multiplier/shift`,
@@ -509,7 +606,7 @@ qui déclencherait un fault) - donc `*effective_bias_ptr++` sur un pointeur NULL
 il lit silencieusement des octets de la table de vecteurs comme si c'était le biais. Résultat :
 chaque porte, à chaque pas de LSTM, ajoutait une valeur de biais complètement fausse (mais
 plausible, dans la bonne plage numérique) - un bug "silencieux" qui a nécessité un test de
-vérification sur device dédié pour être détecté (voir §12).
+vérification sur device dédié pour être détecté (voir §13).
 
 **Comment calculer `input_effective_bias` correctement** (convention TFLite/CMSIS-NN standard,
 confirmée en lisant le générateur de tests officiel de CMSIS-NN,
@@ -547,7 +644,7 @@ tanh).
 avec de vrais flottants (comme le fait `int8_sim.py`, pour rester simple et lisible) ne sera
 **jamais bit-exact** avec le vrai kernel - un écart résiduel de quelques unités par élément est
 attendu et normal (mesuré : ~7/32 éléments différents d'exactement 1 unité, après correction du
-bug du §10.3, contre 22-26/32 avant). Ne cherchez pas à éliminer ce bruit résiduel si vous
+bug du §11.3, contre 22-26/32 avant). Ne cherchez pas à éliminer ce bruit résiduel si vous
 utilisez un simulateur simplifié comme oracle - c'est la limite connue de l'approche, pas un
 bug restant.
 
@@ -561,14 +658,14 @@ ramener à l'échelle calibrée `2^cell_scale_power` :
 - `input_gate` (Q0.15) `* cell_gate` (Q0.15, sortie de tanh) -> produit à l'échelle `2^-30`, à
   requantifier vers `2^cell_scale_power` : facteur réel = `2^(-30-cell_scale_power)`.
 
-Ces deux facteurs réels passent chacun par `quantize_multiplier()` (§7.3) pour donner
+Ces deux facteurs réels passent chacun par `quantize_multiplier()` (§8.3) pour donner
 `forget_to_cell_multiplier/shift` et `input_to_cell_multiplier/shift`. Voir
 `int8_sim.py::cell_multipliers()` pour l'implémentation canonique (partagée entre le
 simulateur et l'export C, pour être sûr que les deux ne divergent jamais).
 
 ---
 
-## 11. Optimisations de performance mesurées
+## 12. Optimisations de performance mesurées
 
 Toutes mesurées sur le vrai matériel (jamais en simulation) - leçon répétée plusieurs fois
 dans cette investigation : **une modification qui "devrait" être plus rapide en lisant le code
@@ -594,7 +691,7 @@ toujours le pipeline entier après chaque changement, pas seulement l'étage mod
 
 ---
 
-## 12. Méthodologie de validation (comment vérifier chaque étape sans se tromper)
+## 13. Méthodologie de validation (comment vérifier chaque étape sans se tromper)
 
 1. **`int8_sim.py`** : un simulateur Python pur (numpy), qui réimplémente ligne à ligne la
    même arithmétique que les vrais kernels CMSIS-NN (`arm_nn_requantize` porté exactement, pas
@@ -612,12 +709,12 @@ toujours le pipeline entier après chaque changement, pas seulement l'étage mod
    (mêmes checkpoint/calibration), rejoue les spectrogrammes réellement capturés par le
    firmware à travers `int8_sim.py`, en conservant l'état LSTM entre buffers (comme le fait
    `ModelInference_run()`), et compare logit par logit au résultat réel du device - c'est ce
-   test qui a permis de détecter/diagnostiquer le bug du §10.3 (corrélation device/PC 0.32 avant
+   test qui a permis de détecter/diagnostiquer le bug du §11.3 (corrélation device/PC 0.32 avant
    correction, 0.9999 après).
 
 ---
 
-## 13. Pièges d'entraînement (parité entraînement/déploiement)
+## 14. Pièges d'entraînement (parité entraînement/déploiement)
 
 Tout ce qui précède concerne le firmware et l'export - cette section couvre des bugs trouvés
 **côté entraînement** (`test-audiomoth-cnn`, pas ce dépôt), découverts après coup en testant le
@@ -627,15 +724,16 @@ réel, pas une version "proche" ou "plus naturelle à coder" - deux fois de suit
 plus simple/continue à coder a silencieusement divergé d'une contrainte réelle du déploiement
 streaming.
 
-### 13.1 Le CNN doit être relancé par buffer à l'entraînement aussi
+### 14.1 Le CNN doit être relancé par buffer à l'entraînement aussi
 
-Le bug le plus significatif de toute cette investigation, plus grave que n'importe quel bug
-firmware du §13 (bugs) ci-dessous : `TinyLSTMCNN.frame_logits()` (`student_model.py`) faisait
+Le bug le plus significatif de cette investigation **avant la découverte du bug AGC/PCEN
+(§14.5, plus grave encore)**, et plus grave que n'importe quel bug firmware du §16 (bugs)
+ci-dessous : `TinyLSTMCNN.frame_logits()` (`student_model.py`) faisait
 tourner les 5 étages de convolution **en continu** sur tout le spectrogramme d'un clip
 d'entraînement (un seul appel `self.features(spectrogram.unsqueeze(1))` sur la séquence
 entière) - donnant à chaque couche de conv un vrai champ réceptif temporel de plusieurs
 buffers, via l'empilement de 3 convolutions à stride 2. Le firmware réel
-(`ModelInference_run()`, §6-9 ci-dessus) relance ce même empilement **à zéro à chaque buffer de
+(`ModelInference_run()`, §7-10 ci-dessus) relance ce même empilement **à zéro à chaque buffer de
 64ms**, ne voyant jamais que les 7 frames STFT de ce buffer - aucun champ réceptif inter-buffer
 pour les couches de conv, seul le LSTM porte un état entre buffers.
 
@@ -667,7 +765,7 @@ même si une version continue "look correcte" et s'entraîne sans erreur. Une di
 type ne casse rien syntaxiquement, elle dégrade juste silencieusement la qualité réelle du
 modèle déployé.
 
-### 13.2 La constante de temps de l'EMA ne doit jamais dépendre de la durée du clip d'entraînement
+### 14.2 La constante de temps de l'EMA ne doit jamais dépendre de la durée du clip d'entraînement
 
 Bug plus subtil, découvert en corrigeant un autre problème (voir 13.3) : `dataset.py` calculait
 `RMS_EMA_BUFFERS = CLIP_SECONDS / (BUFFER_SAMPLES / SAMPLE_RATE)` - dérivant la constante de
@@ -685,7 +783,7 @@ du système déployé en temps réel (secondes réelles), jamais une fonction de
 découpé les données d'entraînement. Toujours vérifier qu'un tel paramètre reste **fixé, pas
 dérivé**, si on touche à la façon dont les clips d'entraînement sont construits.
 
-### 13.3 Diversité de volume dans les données d'entraînement
+### 14.3 Diversité de volume dans les données d'entraînement
 
 Pourquoi ce bug d'EMA a été trouvé : le modèle échouait sur un vrai enregistrement de terrain de
 82s (voix humaine) qu'il reconnaissait bien avant ces changements. Diagnostic : des fenêtres de
@@ -707,11 +805,11 @@ normalisation RMS + le jitter par clip fournissent seuls.
 
 Alternative envisagée puis écartée : supprimer entièrement la normalisation RMS et compter sur
 la seule diversité des données. Gardée malgré tout, car elle limite la plage dynamique réelle en
-entrée de la quantification INT8 (§7) - sans elle, l'échelle fixe de quantification devrait
+entrée de la quantification INT8 (§8) - sans elle, l'échelle fixe de quantification devrait
 couvrir une plage bien plus large, réduisant la précision effective sur les niveaux "typiques"
 et risquant de noyer les signaux faibles/lointains dans le bruit de quantification.
 
-### 13.4 Choisir la bonne métrique : précision à rappel élevé, pas l'AP brute
+### 14.4 Choisir la bonne métrique : précision à rappel élevé, pas l'AP brute
 
 L'AP (average precision) moyenne la précision sur **tous** les niveaux de rappel, y compris des
 niveaux bien en dessous de ce qu'un détecteur utilisable viserait jamais en pratique. Convention
@@ -727,9 +825,51 @@ en temps réel **par buffer** (jamais par clip agrégé), c'est la courbe préci
 **au niveau frame** qui doit servir à calibrer `TRIGGER_LOGIT_THRESHOLD` (`main.c`) - utiliser le
 seuil clip-level donnerait un déclenchement bien plus strict que prévu.
 
+### 14.5 Le bug de parité le plus grave du projet : le gain EMA appliqué avant PCEN à l'entraînement
+
+Découvert après coup, en comparant le comportement du modèle déployé sur de vrais fichiers
+audio de test contre les résultats obtenus sur les clips synthétiques (LibriSpeech + FSD50K) du
+jeu de test - nettement meilleurs sur les seconds. Les tout premiers LSTM entraînés (sans PCEN,
+sans entraînement fenêtré) généralisaient *mieux* sur de vrais enregistrements AudioMoth malgré
+l'absence de toutes les optimisations ajoutées depuis - un signal fort qu'une régression de
+parité training/déploiement, pas juste un écart synthétique-vs-réel ordinaire, s'était glissée
+quelque part.
+
+Cause : `train_student.py::DistillationDataset` a toujours correctement exclu le gain RMS/AGC
+(§4) en dehors du mode `"ema"` - avec sa propre justification documentée : appliquer ce gain
+waveform-domain avant PCEN double-normalise, et PCEN a besoin de la vraie plage dynamique du
+waveform pour calculer des statistiques par bin significatives (voir §6). Le vrai firmware est
+d'accord : `computeBufferGain()` retourne un `1.0f` fixe en mode PCEN, aucun gain waveform-domain
+du tout. Mais `train_windowed.py::_prepare_clip_waveform` (utilisé pour entraîner **tous** les
+checkpoints du sweep d'architectures LSTM/ViT - h16/h32/h64/vit_e32/e48/e64) appliquait ce même
+gain **inconditionnellement**, sans jamais vérifier `NORMALIZATION_MODE` - un oubli lors de
+l'ajout du support PCEN à ce script, pas un choix délibéré.
+
+Conséquence : chaque checkpoint PCEN entraîné via `train_windowed.py` a vu, à l'entraînement, un
+waveform déjà nivelé par l'AGC avant que PCEN ne le voie - mais à l'inférence réelle
+(`predict_timeline.py`, le firmware, un vrai AudioMoth), PCEN reçoit toujours le waveform brut,
+jamais nivelé. Vérifié directement sur un enregistrement réel (`test3.wav`) avec le checkpoint
+`lstm_16_32_64_h64_pcen` : chemin d'inférence réel (brut -> PCEN) donne médiane P(positif)=0.055,
+9.5% des frames >0.5 ; chemin correspondant à l'entraînement (nivelé AGC -> PCEN, le bug) donne
+médiane=0.292, 28.9% des frames >0.5 - corrélation seulement 0.75 entre les deux. Le modèle a
+appris une calibration adaptée à une distribution d'entrée que l'inférence réelle ne lui présente
+jamais.
+
+**Corrigé** en ajoutant le même garde-fou `if NORMALIZATION_MODE == "ema":` que
+`DistillationDataset` a toujours eu. Aucun réexport ne peut réparer un checkpoint déjà entraîné
+avec ce bug - **tous** les checkpoints PCEN existants issus de `train_windowed.py` doivent être
+réentraînés sous le code corrigé avant d'être crus sur de l'audio réel.
+
+**Leçon générale, qui rejoint celle du §14.1** : deux fonctions différentes qui prétendent faire
+"la même préparation d'entrée" pour un même mode de normalisation doivent être vérifiées
+identiques explicitement (même garde-fou, même formule) plutôt que supposées synchrones parce
+qu'elles se ressemblent ou partagent un commentaire de docstring - la divergence ne casse rien
+syntaxiquement, elle dégrade juste silencieusement, et uniquement en dehors du jeu de test
+synthétique sur lequel on validait.
+
 ---
 
-## 14. Mode d'enregistrement déclenché (`TRIGGERED_RECORDING_MODE`)
+## 15. Mode d'enregistrement déclenché (`TRIGGERED_RECORDING_MODE`)
 
 Un troisième mode firmware (mutuellement exclusif avec `STFT_DEBUG_MODE`, `main.c`) : écoute en
 continu, fait tourner le classifieur à chaque buffer de 64ms via le pipeline partagé
@@ -770,15 +910,34 @@ pour produire de vrais enregistrements écoutables) :
   ~16x (~24dB) plus faible qu'il n'aurait dû l'être. Corrigé en appliquant ce même facteur
   (`copyScaledAudioForWav()`) **uniquement** aux copies destinées au fichier WAV - jamais à ce
   qui nourrit `computeSpectrogram()`/`ModelInference_run()`, dont la calibration dépend de
-  l'échelle ADC brute non modifiée sur laquelle le modèle a été entraîné et validé (voir §10).
+  l'échelle ADC brute non modifiée sur laquelle le modèle a été entraîné et validé (voir §11).
 
-Vérification du budget temps réel après ajout de ce mode (même discipline que §11, mesuré sur
+Vérification du budget temps réel après ajout de ce mode (même discipline que §12, mesuré sur
 device réel, jamais estimé) : ~59% du budget 64ms au repos, ~71% dans le pire cas (rafale de
 flush du pre-roll au moment d'un déclenchement) - marge confortable, aucune optimisation requise.
 
+### Checkpoint actuellement déployé et calibration du seuil
+
+`model.h`/`model.c`/`pcen.h`/`pcen.c` embarquent aujourd'hui `student_windowed_lstm_
+lstm_16_32_64_h64_pcen.pt` (canaux 16/32/64, LSTM hidden=64 - `MODEL_HIDDEN_SIZE` dans
+`model.h`, voir §7 pour l'architecture générique), exporté avec `export_int8.py --long-clips
+--calibration-percentile 99.9` (§6). `TRIGGER_PROBABILITY_THRESHOLD` (`main.c`) n'est **pas**
+une constante universelle - c'est la précision-à-rappel≥95% (§14.4) mesurée sur l'export du
+checkpoint en cours, à re-mesurer et remplacer à chaque nouvel export d'un checkpoint différent
+(voir le commentaire au-dessus de la constante dans `main.c`, et l'historique de ses valeurs
+successives dans `EXPERIMENTS.md`).
+
+Validation device-vs-simulateur pour ce mode : basculer temporairement `STFT_DEBUG_MODE=1`/
+`STFT_OUTPUT_MODE=STFT_OUTPUT_MODE_BINARY`/`TRIGGERED_RECORDING_MODE=0` (mutuellement exclusifs,
+voir le haut de `main.c`) pour capturer un `STFT_DATA_*.BIN` contenant le logit réel du modèle
+par buffer, puis `compare_device_output.py --long-clips` (§6) pour le rejouer contre
+`int8_sim.py` - désactiver aussi `STFT_DEBUG_ATTENTION_TEST` pendant cette capture (son propre
+surcoût par buffer risque de faire déborder le budget 64ms et de perdre des buffers, ce qui
+casserait la continuité de l'état LSTM que cette comparaison exige).
+
 ---
 
-## 15. Récapitulatif des bugs rencontrés (pour check-list de non-régression)
+## 16. Récapitulatif des bugs rencontrés (pour check-list de non-régression)
 
 1. **Dispatcher FFT générique** gonfle la flash de ~75KB (tables jamais utilisées) - corrigé en
    appelant `arm_rfft_fast_init_256_f32()` directement.
@@ -789,7 +948,9 @@ flush du pre-roll au moment d'un déclenchement) - marge confortable, aucune opt
    l'audio d'entraînement en `dtype="int16"`.
 4. **Normalisation RMS manquante côté firmware** - corrigé par un gain EMA glissant, répliqué
    à l'identique côté entraînement (`streaming_rms_normalize`).
-5. **Filtre passe-haut manquant côté firmware** - corrigé en masquant les bins < 150Hz.
+5. **Filtre passe-haut manquant côté firmware** - corrigé en masquant les bins < 150Hz. Retiré
+   des deux côtés (entraînement + firmware) puis réintégré plus tard dans le même projet - voir
+   bug 16 ci-dessous et `EXPERIMENTS.md` pour l'historique complet de ce retour en arrière.
 6. **`runAvgPoolFreq()` : indexation NCHW au lieu de NHWC** - corrigé, confirmé par test
    numérique (erreur max 29/127 avant, 0 après).
 7. **Layout des poids depthwise à l'export** - PyTorch `[Cout,1,kH,kW]` écrit tel quel au lieu
@@ -797,32 +958,54 @@ flush du pre-roll au moment d'un déclenchement) - marge confortable, aucune opt
    fausses avant, 0/648 après).
 8. **Jitter de calibration non déterministe** - tiré du RNG global au lieu d'un générateur
    seedé par index - rendait la calibration/export non reproductible d'un run à l'autre.
-9. **LSTM `effective_bias` NULL (bug majeur, §10.3)** - le kernel réel ne lit jamais `bias`,
+9. **LSTM `effective_bias` NULL (bug majeur, §11.3)** - le kernel réel ne lit jamais `bias`,
    seulement `input_effective_bias`/`hidden_effective_bias`, laissés `NULL` -> lecture
    silencieuse de la table de vecteurs d'interruption comme "biais". Corrigé en calculant et
    exportant `input_effective_bias` (et un tableau de zéros pour `hidden_effective_bias`).
    Impact mesuré : corrélation device/PC 0.317 -> 0.9999, écart moyen 0.474 -> 0.0012.
-10. **CNN continu vs relancé par buffer à l'entraînement (bug majeur, §13.1)** - `frame_logits()`
+10. **CNN continu vs relancé par buffer à l'entraînement (bug majeur, §14.1)** - `frame_logits()`
     et les deux réimplémentations d'`export_int8.py` calculaient le CNN en continu sur tout un
     clip, donnant un champ réceptif que le firmware n'a jamais en réalité. Corrigé en relançant
     le CNN par buffer partout, avec un test de cohérence entre les implémentations qui n'existait
     pas avant.
-11. **Constante de temps de l'EMA RMS dérivée de `CLIP_SECONDS` (§13.2)** - aurait silencieusement
+11. **Constante de temps de l'EMA RMS dérivée de `CLIP_SECONDS` (§14.2)** - aurait silencieusement
     désynchronisé l'entraînement du comportement réel du firmware dès qu'on change la durée des
     clips d'entraînement. Corrigée en la fixant à la constante réelle du firmware (46.875
     buffers), indépendamment de `CLIP_SECONDS`.
-12. **`TRIGGERED_RECORDING_MODE` : gain microphone fixe (§14)** - `AM_GAIN_MEDIUM` codé en dur au
+12. **`TRIGGERED_RECORDING_MODE` : gain microphone fixe (§15)** - `AM_GAIN_MEDIUM` codé en dur au
     lieu de `configSettings->gain`, copié d'un outil de test jamais pensé pour produire de vrais
     enregistrements.
-13. **`TRIGGERED_RECORDING_MODE` : facteur d'échelle ×16 manquant sur l'audio WAV (§14)** -
+13. **`TRIGGERED_RECORDING_MODE` : facteur d'échelle ×16 manquant sur l'audio WAV (§15)** -
     l'ADC en lecture brute (`oversampleRate=1`) produit des échantillons ~16x plus petits que la
     convention pleine échelle habituelle ; le firmware normal compense via
     `DigitalFilter_applyFilter()`, que ce mode ne traverse jamais. Corrigé en appliquant ce
     facteur uniquement sur les copies destinées au WAV, jamais sur ce qui nourrit le modèle.
+14. **Calibration INT8 sur le max littéral, PCEN (§6)** - PCEN a une distribution de sortie à
+    queue très lourde ("attack overshoot" transitoire quand `M` n'a pas rattrapé un son fort qui
+    vient de démarrer) : le max littéral gaspille presque toute la résolution INT8 sur des
+    valeurs qui n'arrivent presque jamais. AP frame INT8 87.1% (calibration sur le max) contre
+    96.0% (calibration sur le p99.9), pour le même checkpoint. Corrigé en ajoutant
+    `--calibration-percentile` à `export_int8.py`/`export_pcen.py` (défaut 100 = comportement
+    inchangé, à ajuster explicitement en mode PCEN).
+15. **Gain EMA appliqué avant PCEN à l'entraînement, jamais à l'inférence réelle (bug le plus
+    grave du projet, §14.5)** - `train_windowed.py::_prepare_clip_waveform` appliquait le gain
+    RMS/AGC inconditionnellement, sans jamais vérifier `NORMALIZATION_MODE`, contrairement à
+    `DistillationDataset` qui l'a toujours correctement exclu hors du mode `"ema"`. Tous les
+    checkpoints PCEN issus de `train_windowed.py` (le sweep complet h16/h32/h64/vit_e32/e48/e64)
+    ont été entraînés sur un waveform déjà nivelé par l'AGC avant PCEN, jamais présenté à
+    l'inférence réelle - corrélation mesurée seulement 0.75 entre les deux chemins sur un vrai
+    enregistrement. Corrigé en ajoutant le même garde-fou que `DistillationDataset`. Aucun
+    réexport ne répare un checkpoint déjà entraîné avec ce bug - retraining obligatoire.
 
 **Test de non-régression le plus utile en cas de doute** : pour les bugs 1-9 (parité numérique
 device-vs-PC), relancer `compare_device_output.py` sur une capture fraîche - un écart device/PC
 qui redevient grand et/ou faiblement corrélé signale presque toujours l'un d'eux réapparu. Pour
 les bugs 10-11 (parité entraînement/déploiement), vérifier que `model.frame_logits(spec)` et
-`float_forward_with_traces(spec, folded, model)["logits"]` concordent toujours (§13.1), et que
-`dataset.RMS_EMA_ALPHA` ne change jamais quand `CLIP_SECONDS` change (§13.2).
+`float_forward_with_traces(spec, folded, model)["logits"]` concordent toujours (§14.1), et que
+`dataset.RMS_EMA_ALPHA` ne change jamais quand `CLIP_SECONDS` change (§14.2). Pour le bug 14,
+vérifier qu'`export_int8.py --long-clips` avec `--calibration-percentile 100` (le max) donne un
+AP INT8 nettement pire qu'avec `99.9` sur un checkpoint PCEN - sinon la distribution a changé et
+le percentile mérite d'être réévalué. Pour le bug 15 (le plus insidieux : rien ne plante, la
+dégradation n'apparaît que sur de l'audio réel, jamais sur le jeu de test synthétique), vérifier
+directement que `_prepare_clip_waveform`/`DistillationDataset` ont bien le même garde-fou
+`NORMALIZATION_MODE` avant de faire confiance à un nouveau checkpoint PCEN sur le terrain.
