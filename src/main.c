@@ -23,7 +23,7 @@
    exclusive with TRIGGERED_RECORDING_MODE below - only one of the two may be 1 at a time
    (see the #error guard just below). */
 
-#define STFT_DEBUG_MODE                          1
+#define STFT_DEBUG_MODE                          0
 
 /* ViT real-time benchmark (only with STFT_DEBUG_MODE=1, CSV output): the DMA ISR runs the full
    ViT chain - STFT, PCEN, then vit_inference.c's streaming INT8 TinyViT (real exported
@@ -32,19 +32,26 @@
 
 #define VIT_BENCHMARK                            1
 
-#if VIT_BENCHMARK
-#include "em_device.h"
-#include "vit_inference.h"
+/* On this branch the classifier is the ViT (vit_inference.c), in TRIGGERED_RECORDING_MODE as in
+   VIT_BENCHMARK, and model/pcen.c/.h hold the ViT checkpoint's own learned PCEN - the LSTM path
+   (model_inference.c/model.c) is left in the tree but would run against the wrong PCEN, so the
+   one mode that still calls it is refused. */
+
+#if STFT_DEBUG_MODE && !VIT_BENCHMARK
+#error "model/pcen.c on this branch belongs to the ViT - STFT_DEBUG_MODE's LSTM path would use the wrong PCEN"
 #endif
 
-/* Continuously listens and runs the on-device INT8 classifier (model_inference.c) every
+#include "em_device.h"
+#include "vit_inference.h"
+
+/* Continuously listens and runs the on-device INT8 classifier (vit_inference.c) every
    64ms buffer; whenever its output crosses TRIGGER_PROBABILITY_THRESHOLD, records a new WAV
    file (with ~TRIGGER_PREROLL_SECONDS of pre-roll audio), keeping it open while re-triggered
    (sliding TRIGGER_TAIL_SECONDS countdown) and closing it once the countdown lapses - see
    runTriggeredRecording(). See GUIDE_REIMPLEMENTATION.md for the STFT/model pipeline this
    reuses, and the plan this was built from for the full design rationale. */
 
-#define TRIGGERED_RECORDING_MODE                 0
+#define TRIGGERED_RECORDING_MODE                 1
 
 #if STFT_DEBUG_MODE && TRIGGERED_RECORDING_MODE
 #error "STFT_DEBUG_MODE and TRIGGERED_RECORDING_MODE are mutually exclusive - set at most one to 1"
@@ -3010,11 +3017,13 @@ inline void AudioMoth_handleSwitchInterrupt() {
 
 #define STFT_OUTPUT_MODE                          STFT_OUTPUT_MODE_CSV
 
-#if VIT_BENCHMARK && STFT_OUTPUT_MODE != STFT_OUTPUT_MODE_CSV
-#error "VIT_BENCHMARK only supports STFT_OUTPUT_MODE_CSV"
-#endif
+/* With VIT_BENCHMARK: CSV = per-stage ViT timing (VIT_TIMING.CSV); BINARY = capture of the raw
+   audio, PCEN spectrogram and ViT logit of every buffer (VIT_CAPTURE.BIN, same stftFileHeader_t/
+   stftRecord_t format as the LSTM capture), for replaying real recordings on a PC. */
 
-#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY && VIT_BENCHMARK
+#define STFT_DATA_FILENAME                        "VIT_CAPTURE.BIN"
+#elif STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
 #define STFT_DATA_FILENAME                        "STFT_DATA_" STFT_MODE_SUFFIX ".BIN"
 #elif VIT_BENCHMARK
 #define STFT_DATA_FILENAME                        "VIT_TIMING.CSV"
@@ -3318,11 +3327,31 @@ static void resetRMSNormalization(void) {
 
 }
 
+/* Fixed input gain in PCEN mode - not an adaptive one. The raw one-shot ADC reading this
+   firmware samples (oversampleRate=1) sits ~24dB below the int16 full-scale convention of normal
+   AudioMoth WAVs (see triggerSampleMultiplier) - and of the clips the model was trained on:
+   speech at 1.2m arrived at the model around -52dBFS against -22dBFS for training speech.
+   Applying the same 16x as the WAV path, here folded into the window multiply at no cost,
+   brought soft speech from 53% to 97-100% of the time recorded on a real labelled capture
+   (VIT_CAPTURE.BIN replayed through the exact INT8 C, threshold/consecutive rule unchanged),
+   with no false onset on silence or heavy footsteps. Not yet checked against continuous
+   background noise. */
+
+#define STFT_PCEN_INPUT_GAIN                      16.0f
+
 static float computeBufferGain(const int16_t *source) {
 
     (void)source;
 
+#if STFT_NORMALIZATION_MODE == STFT_NORMALIZATION_PCEN
+
+    return STFT_PCEN_INPUT_GAIN;
+
+#else
+
     return 1.0f;
+
+#endif
 
 }
 
@@ -4028,9 +4057,20 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     uint32_t stftEndCycles = DWT->CYCCNT;
 
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
+
+    /* A capture needs the ViT's state carried through every buffer, so it is never skipped here -
+       a record that doesn't fit in the queue is dropped instead (a gap in bufferIndex). */
+
+    bool vitSkipped = false;
+
+#else
+
     uint32_t queued = (stftRecordQueueWriteIndex - stftRecordQueueReadIndex) & (STFT_RECORD_QUEUE_LENGTH - 1);
 
     bool vitSkipped = queued >= STFT_RECORD_QUEUE_LENGTH / 2;
+
+#endif
 
     static ViTInferenceTiming_t vitTiming;
 
@@ -4058,6 +4098,19 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
         stftRecord_t *record = &stftRecordQueue[stftRecordQueueWriteIndex];
 
+#if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
+
+        record->bufferIndex = stftBufferCounter;
+        record->elapsedMicroseconds = (endTime - startTime) * MICROSECONDS_IN_SECOND + endMicroseconds - startMicroseconds;
+        memcpy(record->audio, source, sizeof(record->audio));
+        memcpy(record->spectrogram, (const void*)stftSpectrogramDb, sizeof(record->spectrogram));
+        record->modelLogit = vitLogit;
+
+        (void)stftEndCycles;
+        (void)vitEndCycles;
+
+#else
+
         record->bufferIndex = stftBufferCounter;
         record->periodCycles = stftBufferCounter == 0 ? 0 : isrStartCycles - vitLastIsrStartCycles;
         record->isrCycles = DWT->CYCCNT - isrStartCycles;
@@ -4068,6 +4121,8 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
         record->logitMilli = (int32_t)(vitLogit * 1000.0f);
         record->vitSkipped = vitSkipped;
         record->droppedRecords = vitDroppedRecords;
+
+#endif
 
         stftRecordQueueWriteIndex = nextWriteIndex;
 
@@ -4512,17 +4567,28 @@ static void runSTFTFeasibilityTest(void) {
    equivalent raw-logit threshold a single time and comparing the raw logit against that
    (monotonic with sigmoid, so equivalent) costs nothing per buffer. */
 
-/* 0.6747 - precision-at-recall>=95% threshold from export_int8.py --long-clips's real INT8
-   evaluation of student_windowed_lstm_lstm_16_32_64_h64_pcen.pt (100 calibration clips, 20
-   test clips, --calibration-percentile 99.9: float32 96.7% frame AP, real INT8 96.0% - the
-   default max-based calibration gave only 87.1% (a real, since-diagnosed issue: PCEN's rare
-   "attack overshoot" transients set an abs_max ~100x its typical range, wasting int8
-   resolution on values that occur in well under 0.1% of frames - see this session's own
-   design discussion/export_int8.py's own calibrate() docstring). Re-tune whenever model.h/
-   pcen.h are re-exported from a different checkpoint - this is per-checkpoint, not a fixed
-   constant. */
+/* 0.8, raised from 0.4096 after real-device testing found 0.4096 too sensitive (re-triggering
+   on ongoing background noise after speech stopped, and on some impulsive noises such as heavy
+   footsteps). 0.4096 is the frame-level precision-at-recall>=95% threshold of the INT8 ViT this
+   firmware actually runs (vit_inference.c + model/vit_model.c, exported from
+   student_windowed_vit_vit_e32_pcen.pt), measured by running that exact C on the host over the
+   first 20 whole test clips (187,500 buffers, frame AP 94.75% vs 95.11% for the float model,
+   selection rule of test-audiomoth-cnn's train_student.plot_pr_curve). Same data, per buffer:
+   precision/recall 78.1%/95.0% at 0.4096, 89.7%/87.0% at 0.8. Combined with
+   TRIGGER_CONSECUTIVE_BUFFERS below - see its comment for the event-level effect. Both are
+   per-checkpoint: re-tune whenever vit_model.c/pcen.c are re-exported. */
 
 #define TRIGGER_PROBABILITY_THRESHOLD              0.8f
+
+/* A buffer only counts as a detection - to open a file, or to restart the tail countdown of an
+   open one - once the model has been above TRIGGER_PROBABILITY_THRESHOLD for this many
+   consecutive buffers (3 = ~192ms), which rejects brief impulsive noises. The onset is
+   reported 2 buffers (128ms) late, well within the ~0.77s pre-roll. Simulated on the same INT8
+   host outputs as the threshold above: false onsets with no speech in them fall from ~650 to
+   ~43 per hour of non-speech (0.4096 alone -> 0.8 with 3 buffers), while 97.3% of speech
+   segments of 0.5s or more still trigger (99.8% before). */
+
+#define TRIGGER_CONSECUTIVE_BUFFERS               3
 
 /* logit(p) = ln(p/(1-p)), the inverse of sigmoid - see TRIGGER_PROBABILITY_THRESHOLD's
    comment above. Computed once in runTriggeredRecording()'s init, not a compile-time
@@ -4531,13 +4597,13 @@ static void runSTFTFeasibilityTest(void) {
 
 static float triggerLogitThreshold;
 
-#define TRIGGER_TAIL_SECONDS                      5.0f
+#define TRIGGER_TAIL_SECONDS                      3.0f
 #define TRIGGER_PREROLL_SECONDS                   0.75f
 
 /* Whole 64ms buffers - the model's/ISR's own granularity - closest to
    ceil(seconds / (MAXIMUM_SAMPLES_IN_DMA_TRANSFER/STFT_SAMPLE_RATE)). */
 
-#define TRIGGER_TAIL_BUFFERS                      79   /* ~5.056s actual */
+#define TRIGGER_TAIL_BUFFERS                      47   /* ~3.008s actual */
 #define TRIGGER_PREROLL_BUFFERS                   12   /* ~0.768s actual */
 
 /* Power of two (indices masked with & (N-1)); usable capacity is TRIGGER_QUEUE_LENGTH-1 -
@@ -4594,8 +4660,8 @@ static volatile uint32_t triggerPrerollWriteIndex;
 static float triggerSampleMultiplier;
 
 /* Scales and clamps one buffer's raw ADC samples by triggerSampleMultiplier before they
-   reach the WAV file - never applied to what feeds computeSpectrogram()/ModelInference_run()
-   (see triggerSampleMultiplier's own comment). */
+   reach the WAV file. The model gets the same 16x through STFT_PCEN_INPUT_GAIN instead, applied
+   in float inside computeSpectrogram() - never through these int16, clamped copies. */
 
 static void copyScaledAudioForWav(int16_t *dst, const int16_t *src) {
 
@@ -4637,18 +4703,31 @@ static uint32_t triggerQueueFreeSlots(void) {
 
 }
 
+/* The DMA is only re-armed once this ISR returns (audiomoth.c's transferComplete), so a single
+   ISR longer than one 64ms buffer stops acquisition for good. Measured (VIT_BENCHMARK): STFT +
+   PCEN + ViT = 37.5ms, plus ~0.7ms for the pre-roll copy below and ~7.8ms more on a trigger
+   onset's pre-roll flush (measured with the LSTM build) - ~46ms worst case. As a safety net the
+   ViT never starts a token that would end past 52ms after ISR entry, which still leaves room for
+   that flush; it never fires at the measured timings. */
+
+#define TRIGGER_VIT_DEADLINE_CYCLES               (52 * 48000)
+
 inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, int16_t **nextBuffer) {
+
+    uint32_t isrStartCycles = DWT->CYCCNT;
 
     int16_t *source = isPrimaryBuffer ? primaryBuffer : secondaryBuffer;
 
     computeSpectrogram(source);
 
-    float logit = ModelInference_run(stftSpectrogramDb, NULL);
+    static ViTInferenceTiming_t vitTiming;
+
+    float logit = ViTInference_run(stftSpectrogramDb, &vitTiming, isrStartCycles + TRIGGER_VIT_DEADLINE_CYCLES);
 
     /* Pre-roll ring: always updated, regardless of trigger state - after this copy its
        newest entry is always the current buffer. Scaled for the WAV file here (see
-       triggerSampleMultiplier's comment) - computeSpectrogram()/ModelInference_run() above
-       already ran on the unscaled source, which is what they need. */
+       triggerSampleMultiplier's comment) - computeSpectrogram() above already read the raw,
+       unclamped source and applied its own STFT_PCEN_INPUT_GAIN. */
 
     copyScaledAudioForWav(triggerPrerollRing[triggerPrerollWriteIndex], source);
 
@@ -4658,7 +4737,11 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
     static uint32_t tailCountdown;
 
-    bool triggered = logit > triggerLogitThreshold;
+    static uint32_t aboveThresholdStreak;
+
+    aboveThresholdStreak = logit > triggerLogitThreshold ? aboveThresholdStreak + 1 : 0;
+
+    bool triggered = aboveThresholdStreak >= TRIGGER_CONSECUTIVE_BUFFERS;
 
     if (recordingActive == false) {
 
@@ -4959,12 +5042,11 @@ static void runTriggeredRecording(void) {
        without any correction, so leaving this unapplied - as this mode did until now, since
        it never calls DigitalFilter_applyFilter() at all, sampling raw via DMA directly -
        made every triggered recording come out ~16x (~24dB) quieter than a normal one at the
-       same configured gain. Deliberately applied ONLY to the copies feeding the WAV file
-       (see copyScaledAudioForWav() below) - never to what feeds computeSpectrogram()/
-       ModelInference_run(), whose calibration (RMS normalization target, INT8 quantization
-       scales) is tied to this same raw, unscaled ADC convention the model was trained and
-       validated against (see EXPERIMENTS.md) - scaling that input too would be a real
-       train/inference mismatch, not a fix. */
+       same configured gain. Applied here only to the int16 copies feeding the WAV file (see
+       copyScaledAudioForWav() below). The model's input gets the same 16x separately, in float
+       and without clamping (STFT_PCEN_INPUT_GAIN in computeSpectrogram()): a real labelled
+       capture showed the raw ADC convention left speech ~30dB below the level of the clips the
+       model was trained on. */
 
     triggerSampleMultiplier = 16.0f / (float)(1 * 1);
 
@@ -4989,7 +5071,15 @@ static void runTriggeredRecording(void) {
 
     AudioMoth_setGreenLED(false);
 
-    ModelInference_reset();
+    /* DWT cycle counter, for the ISR's ViT deadline (TRIGGER_VIT_DEADLINE_CYCLES) */
+
+    DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
+
+    DWT->CYCCNT = 0;
+
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    ViTInference_reset();
 
     resetRMSNormalization();
 
