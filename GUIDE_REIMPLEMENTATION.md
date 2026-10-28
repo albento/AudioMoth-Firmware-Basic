@@ -65,7 +65,7 @@ normalisation.
   (`audiomoth.c`) configure `readSetupCycles=2 + readStrobeCycles=3 + readHoldCycles=1` = 6
   cycles par accès - **plus lent que la flash**, contrairement à l'intuition "RAM = plus
   rapide". Utile uniquement parce qu'elle offre du volume, pas de la vitesse : on y place les
-  buffers d'activation trop gros pour la RAM interne (voir section 9), pas du code ou des
+  buffers d'activation trop gros pour la RAM interne (voir §10), pas du code ou des
   données chaudes.
 - **Conséquence pratique** : tout ce qui est lu/écrit souvent (poids du modèle, buffers de
   travail des kernels CMSIS-NN) doit rester en flash (pour les poids, en lecture seule) ou en
@@ -121,8 +121,8 @@ Astuce classique IEEE-754 : pour un `float32` positif `x`, son motif binaire bru
 décalage et une soustraction - aucune division/multiplication flottante. `log10(x)` s'obtient
 ensuite par une seule multiplication en virgule fixe Q16.16 par `log10(2)`.
 
-Le biais naïf de 127 est exact seulement aux puissances de deux ; la correction empirique
-`126.95696433397204` recentre l'erreur autour de zéro, réduisant l'erreur max de 0.52dB à
+Le biais naïf de 127 est exact seulement aux puissances de deux ; le biais corrigé
+`126.95696433397204` (dérivé analytiquement, puis vérifié par balayage numérique) recentre l'erreur autour de zéro, réduisant l'erreur max de 0.52dB à
 0.26dB sur le résultat final `20*log10(x)`, pour le même coût.
 
 Voir `stftFastLog2Q16_16()`/`stftFastLog10()` dans `main.c`, et son port bit-exact côté Python
@@ -166,13 +166,22 @@ appliqué à ce buffer avant fenêtrage/FFT.
 ```c
 // résumé de computeBufferGain() (main.c)
 bufferMeanSq = mean(source[i]^2 pour i dans le buffer)   // échelle int16 brute
+alpha = (bufferMeanSq > runningMeanSq) ? RISE_ALPHA : FALL_ALPHA     // deux constantes de temps
 runningMeanSq = alpha * bufferMeanSq + (1-alpha) * runningMeanSq
 gain = targetRmsRaw / sqrt(runningMeanSq + eps)
 ```
 
-avec `alpha = 2/(N+1)`, `N` choisi pour que la constante de temps de l'EMA corresponde à la
-durée d'un clip d'entraînement (3s ici, soit ~46.875 buffers de 64ms) - convention standard
-pour "cette moyenne exponentielle se comporte comme une moyenne glissante sur N échantillons".
+avec `alpha = 2/(N+1)` - convention standard pour "cette moyenne exponentielle se comporte
+comme une moyenne glissante sur N échantillons". Deux valeurs de `N` :
+`STFT_RISE_EMA_BUFFERS = 46.875` (~3s, montée lente) et `STFT_FALL_EMA_BUFFERS = 16` (~1s,
+descente plus rapide). C'est l'asymétrie **inverse** d'un AGC classique (attaque rapide,
+relâchement lent) : une montée rapide réagirait à la parole détectée elle-même et baisserait le
+gain pendant qu'elle est présente ; une descente trop lente laisserait le gain écrasé pendant
+~3s après un événement fort. `FALL` valait 8 (~0.5s) à l'origine, ce qui provoquait du
+"pumping" sur de l'audio réel (justification complète dans le commentaire au-dessus de ces
+constantes, `main.c`). Ces constantes sont **fixes** du système temps réel : elles doivent
+rester égales à `RISE_EMA_BUFFERS`/`FALL_EMA_BUFFERS` de `dataset.py`, et ne jamais être
+dérivées de la durée des clips d'entraînement (voir §14.2, bug réel).
 Le gain est replié directement dans la multiplication par la fenêtre de Hann
 (`stftFrame[i] = source[i] * window[i] * gain`), jamais appliqué en modifiant le buffer DMA
 brut.
@@ -264,7 +273,7 @@ calibration, donc pas un artefact d'échantillon). Calibration sur le p99.9
 --calibration-percentile 99.9` (et son propre docstring `calibrate()`/`calibrate_long()` pour
 l'implémentation : échantillonnage aléatoire **seedé** - `CALIBRATION_SAMPLE_SEED` - pas le RNG
 global, pour que deux calibrations du même checkpoint restent reproductibles bit à bit, même
-piège que celui déjà documenté en §4/§14.5).
+piège que celui déjà documenté en §4 et au bug 8 du §16).
 
 `compare_device_output.py --long-clips` (mêmes flags qu'`export_int8.py`) rejoue une capture
 réelle du device contre `int8_sim.py` pour un checkpoint PCEN/clips longs - corrige au passage
@@ -279,7 +288,9 @@ sur une longue séquence, partagée par le device et la simulation, pas un bug f
 
 ## 7. Le modèle : TinyLSTMCNN
 
-Architecture (`student_model.py::TinyLSTMCNN`, canaux 16/32/64, LSTM hidden=16) :
+Architecture (`student_model.py::TinyLSTMCNN`, canaux 16/32/64, LSTM de taille cachée `H` -
+`H=64` dans le checkpoint actuellement déployé, `MODEL_HIDDEN_SIZE` dans `model.h` ; les
+premières versions utilisaient `H=16`, et plusieurs mesures de ce guide datent de cette époque) :
 
 | Étage | Type | in_ch | out_ch | kernel | stride | pad | groups |
 |---|---|---|---|---|---|---|---|
@@ -289,13 +300,13 @@ Architecture (`student_model.py::TinyLSTMCNN`, canaux 16/32/64, LSTM hidden=16) 
 | stage2_dw | depthwise | 32 | 32 | 3x3 | 2 | 1 | 32 |
 | stage2_pw | pointwise 1x1 | 32 | 64 | 1x1 | 1 | 0 | 1 |
 
-Chaque conv est suivie de BatchNorm (fusionné dans les poids avant quantification, voir §9) et
+Chaque conv est suivie de BatchNorm (fusionné dans les poids avant quantification, par `export_int8.py`) et
 ReLU. Avec l'entrée `[1, 129, 7]` (fréquence x temps), les 3 étages à stride 2 réduisent le
 temps `7 -> 4 -> 2 -> 1` : **un seul pas de temps en sortie par buffer**.
 
 Ensuite : `AdaptiveAvgPool2d((1, None))` (moyenne sur l'axe fréquence uniquement, garde le
-temps) -> LSTM à une couche (`nn.LSTM(64, 16, batch_first=True)`) -> classifieur linéaire
-(`nn.Linear(16, 1)`).
+temps) -> LSTM à une couche (`nn.LSTM(64, H, batch_first=True)`) -> classifieur linéaire
+(`nn.Linear(H, 1)`).
 
 ---
 
@@ -304,7 +315,7 @@ temps) -> LSTM à une couche (`nn.LSTM(64, 16, batch_first=True)`) -> classifieu
 Toute cette section est indépendante de CMSIS-NN - ce sont les conventions génériques de
 quantification "affine" utilisées par TFLite et reprises telles quelles par CMSIS-NN.
 
-### 7.1 Scale et zero-point
+### 8.1 Scale et zero-point
 
 Une valeur réelle `r` est représentée par un entier quantifié `q` via `r = scale * (q -
 zero_point)`. Ici, **zero_point est toujours 0** (quantification "symétrique") : `r = scale *
@@ -312,7 +323,7 @@ q`. C'est un choix de simplicité (pas de terme de correction `zero_point * somm
 gérer dans les convolutions), au prix d'un poil de précision (le 0 n'est pas forcément le
 centre optimal de la plage).
 
-### 7.2 Scale par canal (poids conv) vs par tenseur (poids LSTM)
+### 8.2 Scale par canal (poids conv) vs par tenseur (poids LSTM)
 
 - **Poids de convolution** : quantifiés **par canal de sortie** (`per_channel_scale`) - chaque
   filtre de sortie a sa propre échelle, ce qui capture mieux la variance de poids entre
@@ -324,7 +335,7 @@ centre optimal de la plage).
   qu'un `input_multiplier`/`input_shift` scalaire par porte, pas un tableau. Ne réutilisez donc
   pas la même fonction de quantification par canal pour les poids LSTM.
 
-### 7.3 Le "multiplier/shift" : comment CMSIS-NN représente un facteur réel
+### 8.3 Le "multiplier/shift" : comment CMSIS-NN représente un facteur réel
 
 Après une multiplication matricielle en int8, l'accumulateur est en int32, à une échelle
 `input_scale * weight_scale` qu'il faut ramener à l'échelle de sortie voulue
@@ -363,7 +374,7 @@ divergeront subtilement du "vrai" calcul quantifié que le firmware final exécu
 exactement pour ça que `int8_sim.py` réimplémente `arm_nn_requantize` ligne à ligne plutôt que
 d'utiliser une division flottante "équivalente").
 
-### 7.4 Quantification du biais
+### 8.4 Quantification du biais
 
 Le biais d'une conv/linéaire est quantifié dans le domaine de l'accumulateur **avant**
 requantization : `bias_q = round(bias_float / (input_scale * weight_scale))`, ajouté à
@@ -383,7 +394,7 @@ etc., chacune prenant des poids/biais/paramètres de quantification déjà prép
 logique de quantification *dans* CMSIS-NN elle-même - c'est à vous de la faire, comme dans
 `export_int8.py`).
 
-### 8.1 Structures communes
+### 9.1 Structures communes
 
 - `cmsis_nn_context` : `{ void *buf; int32_t size; }` - un buffer scratch générique que
   certains kernels demandent (voir `arm_convolve_s8`/`arm_depthwise_conv_s8_opt` ci-dessous).
@@ -400,7 +411,7 @@ logique de quantification *dans* CMSIS-NN elle-même - c'est à vous de la faire
 - `cmsis_nn_per_channel_quant_params` : `{ int32_t *multiplier; int32_t *shift; }` - un
   multiplicateur/shift par canal de sortie (voir §8.3).
 
-### 8.2 `arm_convolve_s8` : convolution générale, et le piège de l'im2col
+### 9.2 `arm_convolve_s8` : convolution générale, et le piège de l'im2col
 
 `arm_convolve_s8` implémente une convolution 2D int8 générique via la technique **im2col** :
 pour chaque position de sortie, elle "déroule" (gather) la fenêtre d'entrée correspondante en
@@ -424,7 +435,7 @@ précis (`in_ch=1`), lisant les 9 valeurs du noyau directement dans le tenseur d
 buffer im2col du tout. Ceci n'est possible/correct **que parce que `input_offset` (le
 zero-point d'entrée) est 0** dans tout ce modèle - une position de padding contribue alors
 `0 * poids = 0` à la somme, qu'on peut simplement *sauter* au lieu de la mettre à zéro
-explicitement (voir §12.3 pour le code). Ne faites jamais ça si votre modèle a un
+explicitement (voir `runStage0Conv()` dans `model_inference.c` pour le code). Ne faites jamais ça si votre modèle a un
 `input_offset` non nul (asymétrique) : il faudrait alors ajouter `input_offset * poids` pour
 chaque tap manquant, ce qui annule tout le bénéfice.
 
@@ -432,7 +443,7 @@ Pour les 2 étages "pointwise" (1x1, stride 1, pad 0), im2col ne fait presque ri
 1x1 = juste le pixel lui-même, pas de gather réel) donc `arm_convolve_s8` reste la meilleure
 option mesurée ici - voir §12 pour la tentative avortée de le remplacer.
 
-### 8.3 `arm_depthwise_conv_s8` vs `arm_depthwise_conv_s8_opt`
+### 9.3 `arm_depthwise_conv_s8` vs `arm_depthwise_conv_s8_opt`
 
 Une convolution "depthwise" applique un filtre séparé à chaque canal d'entrée (pas de mélange
 entre canaux) - `groups == in_channels`. CMSIS-NN a deux implémentations :
@@ -462,7 +473,7 @@ ré-export nécessaire) a donné -25% et -21% sur ces deux étages.
 générique - et vérifiez `output_ch % 4 == 0`, sinon vous retombez sur sa boucle résiduelle
 scalaire (toujours plus rapide que la version generic, mais moins bon que le cas nominal).
 
-### 8.4 Pas de kernel pour "pooling fréquence seule"
+### 9.4 Pas de kernel pour "pooling fréquence seule"
 
 `arm_avgpool_s8` moyenne sur **les deux** axes spatiaux (H et W) - il n'existe aucune fonction
 CMSIS-NN pour "moyenner H, garder W" (ce dont ce modèle a besoin :
@@ -481,7 +492,7 @@ confirmé par un test numérique direct contre `int8_sim.py` (erreur max 29 sur 
 0-127). **Vérifiez toujours le layout réel en lisant le code source du kernel qui produit le
 tenseur que vous consommez**, ne vous fiez pas à une intuition "comme en PyTorch".
 
-### 8.5 Classifieur final : `arm_fully_connected_s8` ou dot product manuel
+### 9.5 Classifieur final : `arm_fully_connected_s8` ou dot product manuel
 
 Pour une seule sortie scalaire (`nn.Linear(hidden_size, 1)`), un dot product manuel int32
 (`sum(weight[i] * hidden[i]) + bias`) suivi d'une conversion directe en flottant via un
@@ -509,7 +520,7 @@ C'est ici qu'a eu lieu le bug le plus sérieux de toute l'investigation (biais s
 faux sur chaque pas de LSTM, chaque buffer) - cette section mérite d'être lue attentivement
 avant toute réimplémentation.
 
-### 10.1 Vue d'ensemble : structures et convention de format
+### 11.1 Vue d'ensemble : structures et convention de format
 
 Un LSTM a 4 "portes" (forget, input, cell, output), chacune calculée comme :
 `porte = activation(x @ W_input.T + h_prev @ W_hidden.T + bias)`, où `activation` est sigmoïde
@@ -523,7 +534,7 @@ Un LSTM a 4 "portes" (forget, input, cell, output), chacune calculée comme :
   l'état cellule (`forget_to_cell_multiplier/shift`, `input_to_cell_multiplier/shift`,
   `cell_clip`, `cell_scale_power`) et à la sortie (`output_multiplier/shift`, `output_offset`).
 - `cmsis_nn_lstm_context` : 3 buffers scratch (`temp1`, `temp2`, `cell_state`), chacun de
-  `hidden_size * sizeof(int16_t)` - minuscule (32 octets pour hidden_size=16).
+  `hidden_size * sizeof(int16_t)` - minuscule (128 octets pour hidden_size=64, 32 pour hidden_size=16).
 
 **Conventions de format fixes** (pas calibrées, imposées par le kernel) :
 - La **pré-activation** de chaque porte (avant sigmoïde/tanh) est en **Q3.12** (échelle
@@ -534,7 +545,7 @@ Un LSTM a 4 "portes" (forget, input, cell, output), chacune calculée comme :
   cellule prend en général des valeurs de quelques unités et qu'int16 offre bien plus de
   marge que ça).
 
-### 10.2 `arm_nn_lstm_step_s8` : le déroulé exact d'un pas
+### 11.2 `arm_nn_lstm_step_s8` : le déroulé exact d'un pas
 
 Code réel (`CMSIS-NN/Source/NNSupportFunctions/arm_nn_lstm_step_s8.c`), résumé :
 
@@ -564,7 +575,7 @@ Le calcul de `hidden_temp` fait `cell_scale_power + 12` : c'est la conversion de
 qui attend toujours du Q3.12 en entrée - un décalage de `cell_scale_power - (-12) =
 cell_scale_power + 12` bits.
 
-### 10.3 LE PIÈGE : `bias` n'est jamais lu, seul `*_effective_bias` compte
+### 11.3 LE PIÈGE : `bias` n'est jamais lu, seul `*_effective_bias` compte
 
 `arm_nn_lstm_calculate_gate_s8_s16()` (appelée pour chaque porte) :
 
@@ -631,7 +642,7 @@ champs sont **réellement lus**. Un champ qui existe dans une structure document
 bien n'être là que pour un usage différent (ici : uniquement utile à un simulateur de test
 CMSIS-NN interne, pas au kernel réel).
 
-### 10.4 Activation : table de correspondance (LUT), pas un vrai calcul flottant
+### 11.4 Activation : table de correspondance (LUT), pas un vrai calcul flottant
 
 `arm_nn_activation_s16()` calcule sigmoïde/tanh via une table de correspondance
 (`sigmoid_table_uint16`) avec interpolation linéaire entre entrées adjacentes - jamais un vrai
@@ -643,12 +654,12 @@ tanh).
 **Conséquence pour la validation** : un simulateur Python "propre" qui calcule sigmoïde/tanh
 avec de vrais flottants (comme le fait `int8_sim.py`, pour rester simple et lisible) ne sera
 **jamais bit-exact** avec le vrai kernel - un écart résiduel de quelques unités par élément est
-attendu et normal (mesuré : ~7/32 éléments différents d'exactement 1 unité, après correction du
+attendu et normal (mesuré avec hidden_size=16 : ~7/32 éléments différents d'exactement 1 unité, après correction du
 bug du §11.3, contre 22-26/32 avant). Ne cherchez pas à éliminer ce bruit résiduel si vous
 utilisez un simulateur simplifié comme oracle - c'est la limite connue de l'approche, pas un
 bug restant.
 
-### 10.5 Dérivation des multiplicateurs `forget_to_cell`/`input_to_cell`
+### 11.5 Dérivation des multiplicateurs `forget_to_cell`/`input_to_cell`
 
 La mise à jour de l'état cellule combine deux produits à des échelles différentes qu'il faut
 ramener à l'échelle calibrée `2^cell_scale_power` :
@@ -767,14 +778,14 @@ modèle déployé.
 
 ### 14.2 La constante de temps de l'EMA ne doit jamais dépendre de la durée du clip d'entraînement
 
-Bug plus subtil, découvert en corrigeant un autre problème (voir 13.3) : `dataset.py` calculait
+Bug plus subtil, découvert en corrigeant un autre problème (voir §14.3) : `dataset.py` calculait
 `RMS_EMA_BUFFERS = CLIP_SECONDS / (BUFFER_SAMPLES / SAMPLE_RATE)` - dérivant la constante de
 temps de la moyenne glissante RMS de la **durée du clip d'entraînement**. Mais côté firmware,
-`STFT_RMS_EMA_BUFFERS = 46.875f` (`main.c`) est une constante **fixe**, ~3 secondes réelles,
+`STFT_RISE_EMA_BUFFERS = 46.875f` (`main.c`, de même que `STFT_FALL_EMA_BUFFERS`, §4) est une constante **fixe**, ~3 secondes réelles,
 sans aucune notion de "durée de clip" (un enregistrement réel n'en a pas). Les deux ne
 coïncidaient que parce que `CLIP_SECONDS` valait justement 3.0 au moment où la formule a été
 écrite - changer `CLIP_SECONDS` (par exemple pour donner au modèle de vrais clips plus longs,
-voir 13.3) aurait silencieusement étiré aussi la constante de temps de l'EMA côté entraînement,
+voir §14.3) aurait silencieusement étiré aussi la constante de temps de l'EMA côté entraînement,
 désynchronisant le comportement appris du comportement réel du firmware, sans qu'aucune erreur
 ne le signale.
 
@@ -822,7 +833,7 @@ niveau frame (mesuré : 0.9546 vs 0.0561, sur le même modèle) - normal, un cli
 secondes n'a besoin que d'**un seul** frame positif pour être positif au niveau clip, donc le
 seuil par frame doit être bien plus permissif pour ne rater aucun clip. Comme le firmware décide
 en temps réel **par buffer** (jamais par clip agrégé), c'est la courbe précision-rappel
-**au niveau frame** qui doit servir à calibrer `TRIGGER_LOGIT_THRESHOLD` (`main.c`) - utiliser le
+**au niveau frame** qui doit servir à calibrer `TRIGGER_PROBABILITY_THRESHOLD` (`main.c`) - utiliser le
 seuil clip-level donnerait un déclenchement bien plus strict que prévu.
 
 ### 14.5 Le bug de parité le plus grave du projet : le gain EMA appliqué avant PCEN à l'entraînement
@@ -874,13 +885,19 @@ synthétique sur lequel on validait.
 Un troisième mode firmware (mutuellement exclusif avec `STFT_DEBUG_MODE`, `main.c`) : écoute en
 continu, fait tourner le classifieur à chaque buffer de 64ms via le pipeline partagé
 (`computeSpectrogram()`, factorisé pour être réutilisé par les deux modes de debug), et dès que
-le logit dépasse `TRIGGER_LOGIT_THRESHOLD`, ouvre un nouveau fichier WAV - avec ~0.75s de
-pre-roll (anneau circulaire des derniers buffers, toujours mis à jour, indépendamment de l'état
-de déclenchement), reste ouvert tant que le modèle re-déclenche (fenêtre glissante de 5s,
-réinitialisée à chaque re-déclenchement), et se ferme une fois le décompte écoulé - un fichier
+la sortie du modèle dépasse `TRIGGER_PROBABILITY_THRESHOLD`, ouvre un nouveau fichier WAV - avec
+~0.75s de pre-roll (anneau circulaire des derniers buffers, toujours mis à jour, indépendamment
+de l'état de déclenchement), reste ouvert tant que le modèle re-déclenche (fenêtre glissante de
+`TRIGGER_TAIL_SECONDS`, réinitialisée à chaque re-déclenchement), et se ferme une fois le décompte écoulé - un fichier
 distinct par événement de détection, contrairement au mécanisme de seuil d'amplitude déjà
 présent dans le firmware normal (`makeRecording()`), qui ne garde jamais qu'un seul fichier
 continu avec des trous compressés.
+
+Le seuil se règle en probabilité (`TRIGGER_PROBABILITY_THRESHOLD`) ; il est converti une seule
+fois au démarrage en un seuil sur le logit brut (`triggerLogitThreshold = logit(p)`), comparé
+ensuite à chaque buffer - équivalent puisque la sigmoïde est monotone, et cela évite d'appeler
+`expf()`/`logf()` dans l'ISR. `TRIGGER_TAIL_BUFFERS`/`TRIGGER_PREROLL_BUFFERS` sont les durées
+correspondantes arrondies au buffer de 64ms : à mettre à jour à la main si les durées changent.
 
 Architecture : un anneau de pre-roll (audio brut, toujours écrit) + une file d'attente
 producteur (ISR)/consommateur (boucle principale) d'enregistrements étiquetés par événement
@@ -910,11 +927,20 @@ pour produire de vrais enregistrements écoutables) :
   ~16x (~24dB) plus faible qu'il n'aurait dû l'être. Corrigé en appliquant ce même facteur
   (`copyScaledAudioForWav()`) **uniquement** aux copies destinées au fichier WAV - jamais à ce
   qui nourrit `computeSpectrogram()`/`ModelInference_run()`, dont la calibration dépend de
-  l'échelle ADC brute non modifiée sur laquelle le modèle a été entraîné et validé (voir §11).
+  l'échelle ADC brute non modifiée sur laquelle le modèle a été entraîné et validé (voir §4 et §13).
 
 Vérification du budget temps réel après ajout de ce mode (même discipline que §12, mesuré sur
 device réel, jamais estimé) : ~59% du budget 64ms au repos, ~71% dans le pire cas (rafale de
 flush du pre-roll au moment d'un déclenchement) - marge confortable, aucune optimisation requise.
+
+**Attention : cette mesure ne couvre pas la configuration déployée aujourd'hui.** Elle date du
+commit `8f3f224` (4 août), donc avec le modèle LSTM hidden=16 et la normalisation EMA - avant
+l'arrivée de PCEN (`35653d2`, 8 août) et du modèle hidden=64. Le passage à hidden=64 ajoute à
+lui seul ~3.5ms d'inférence (mesuré en `STFT_DEBUG_MODE`, voir `EXPERIMENTS.md`), et le coût de
+PCEN n'a jamais été mesuré isolément. Une capture `STFT_DEBUG_MODE` de 414 buffers sans trou
+avec hidden=64 + PCEN montre que le cas "au repos" tient dans les 64ms, mais le **pire cas**
+(rafale de flush du pre-roll, ~7.8ms de plus) n'a pas été re-mesuré avec hidden=64 + PCEN.
+Estimation grossière, pas une mesure : ~41ms au repos + coût PCEN + ~7.8ms au déclenchement.
 
 ### Checkpoint actuellement déployé et calibration du seuil
 
@@ -926,6 +952,15 @@ une constante universelle - c'est la précision-à-rappel≥95% (§14.4) mesuré
 checkpoint en cours, à re-mesurer et remplacer à chaque nouvel export d'un checkpoint différent
 (voir le commentaire au-dessus de la constante dans `main.c`, et l'historique de ses valeurs
 successives dans `EXPERIMENTS.md`).
+
+**À vérifier avant de faire confiance à l'export embarqué** :
+- §14.5 invalide tous les checkpoints PCEN de `train_windowed.py` entraînés avant le correctif
+  du gain AGC (commit `82b74a00` de `test-audiomoth-cnn`, 10 août). Vérifier que le `.pt` exporté
+  dans `model/` a bien été entraîné après ce commit, et noter lequel dans `EXPERIMENTS.md` à
+  chaque réexport - le nom de tag (`MODEL_TAG`) seul ne permet pas de le savoir.
+- Si `TRIGGER_PROBABILITY_THRESHOLD` est choisi autrement que par la règle P@R≥95% ci-dessus (par
+  exemple à l'écoute de vrais enregistrements), noter la valeur et la raison dans
+  `EXPERIMENTS.md` : sinon on ne peut plus distinguer un choix délibéré d'un oubli de mise à jour.
 
 Validation device-vs-simulateur pour ce mode : basculer temporairement `STFT_DEBUG_MODE=1`/
 `STFT_OUTPUT_MODE=STFT_OUTPUT_MODE_BINARY`/`TRIGGERED_RECORDING_MODE=0` (mutuellement exclusifs,
@@ -996,6 +1031,12 @@ casserait la continuité de l'état LSTM que cette comparaison exige).
     l'inférence réelle - corrélation mesurée seulement 0.75 entre les deux chemins sur un vrai
     enregistrement. Corrigé en ajoutant le même garde-fou que `DistillationDataset`. Aucun
     réexport ne répare un checkpoint déjà entraîné avec ce bug - retraining obligatoire.
+16. **Bin DC (bin 0) codé en dur au plancher (§5)** - trouvé en réintégrant le masque passe-haut
+    côté firmware : `arm_rfft_fast_f32` range le bin DC à part (`stftFFTOutput[0]`), et les quatre
+    branches `STFT_LOG_MODE`/PCEN le forçaient au plancher masqué/epsilon au lieu de calculer sa
+    vraie valeur. Corrigé en utilisant `fabsf(stftFFTOutput[0])`, comme le bin de Nyquist le
+    faisait déjà. Ce bug ne se voit pas tant que le masque est actif (le bin 0 est masqué de
+    toute façon) : il ne se manifeste que si on retire le masque.
 
 **Test de non-régression le plus utile en cas de doute** : pour les bugs 1-9 (parité numérique
 device-vs-PC), relancer `compare_device_output.py` sur une capture fraîche - un écart device/PC

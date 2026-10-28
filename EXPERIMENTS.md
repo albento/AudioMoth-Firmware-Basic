@@ -1,8 +1,10 @@
-# STFT feasibility experiments (`debug` branch)
+# On-device detection experiments (`debug` branch)
 
-Summary of the experiments run to check whether computing a spectrogram on-device, in real
-time, is feasible on the AudioMoth Dev as a first step toward on-device animal-call detection
-(STFT feature extraction now, CMSIS-NN classifier later).
+Chronological log of the experiments on this branch, toward on-device animal-call detection on
+the AudioMoth Dev. It started as an STFT feasibility check (first sections below) and grew to
+cover the INT8 classifier (CMSIS-NN), device-vs-PC parity, triggered recording, PCEN, a ViT
+cost probe, and training-side findings. Sections are in the order the work happened, so later
+sections can supersede earlier ones - `GUIDE_REIMPLEMENTATION.md` is the up-to-date reference.
 
 ## Goal and method
 
@@ -467,8 +469,8 @@ the `lstmMismatches` timing field, the corresponding CSV/binary column) was remo
 was confirmed; the permanent fix (`input_effective_bias`/`hidden_effective_bias` wiring,
 `export_int8.py`'s `_quantize_gate()` change) stayed.
 
-**Takeaway**: five independent, real bugs (STFT framing, scale, RMS normalization, high-pass
-filter, avgpool indexing, weight export layout) each moved the numbers, but none of them alone
+**Takeaway**: the five other real fixes above (STFT framing + int16 scale, RMS normalization,
+high-pass filter, avgpool indexing, weight export layout) each moved the numbers, but none of them alone
 explained a mismatch this large and this flat across the recording - only reading the actual
 CMSIS-NN kernel source (rather than trusting the struct field names `bias` vs `*_effective_bias`
 to mean what they suggest) found the dominant cause. As elsewhere in this investigation, the
@@ -742,7 +744,7 @@ the placeholder and real-weights builds too, as expected (same array sizes, only
 No real hardware timing measurement yet (no SWD probe available - see project notes); a rough
 op-count estimate (`computePcenBin` does ~2 `stftFastPow` calls plus a handful of multiply/add/
 divide per bin, x129 bins x7 frames/buffer) suggests a modest increase over the existing
-~10.9ms/buffer STFT measurement, still comfortably inside the 64ms budget - but this is an
+~4.7ms/buffer STFT measurement (fixed-point log10, after the parity fixes), still comfortably inside the 64ms budget - but this is an
 estimate, not a measurement. Use the existing `STFT_DEBUG_MODE` CSV timing infrastructure
 (`ModelInferenceTiming_t`, per-stage `elapsedMicroseconds`) to get a real number now that this
 is flashable with real (non-placeholder) `pcen.h`/`pcen.c`.
@@ -750,10 +752,16 @@ is flashable with real (non-placeholder) `pcen.h`/`pcen.c`.
 ### Still needed before this is actually deployable
 
 1. ~~Regenerate `model/pcen.h`/`pcen.c` for real~~ - done (see above).
-2. ~~Real hardware timing~~ - done, indirectly: "Triggered recording" below's real-hardware
-   budget check (~59%/71% of 64ms) runs the full STFT+PCEN+model pipeline on real hardware,
-   PCEN included (it's the compiled-in normalization for that build) - not a PCEN-isolated
-   number, but confirms the whole pipeline (PCEN's own cost included) has real headroom.
+2. Real hardware timing - **only partly done.** This item was first marked done on the basis
+   of the "Triggered recording" section above (~59%/71% of 64ms), but that measurement predates
+   PCEN: it was taken at commit `8f3f224` (4 Aug, LSTM hidden=16, EMA normalization), before
+   PCEN was compiled in (`35653d2`, 8 Aug) and before the hidden=64 model. What is actually
+   known for hidden=64 + PCEN: the 414-buffer `STFT_DEBUG_MODE` capture below had no gaps, so
+   the idle case fits in 64ms. PCEN's own cost has since been measured in the ViT benchmark
+   (end of this file): STFT + PCEN = 6.0ms vs 4.7ms for STFT + EMA, i.e. ~+1.3ms. Still
+   unmeasured: the triggered-mode worst case (pre-roll flush burst, ~7.8ms on top of idle) with
+   hidden=64 + PCEN. Rough estimate, not a measurement: ~42.6ms idle (37.8ms + ~3.5ms for
+   hidden=64 + ~1.3ms PCEN), ~50ms on trigger.
 3. ~~Device-vs-PC numerical parity check~~ - done: `compare_device_output.py --long-clips`
    (see "Post-PCEN-deployment findings" below) now rebuilds the exact `QuantizedModel`
    (channels/hidden_size/calibration-percentile all threaded through) and replays a real
@@ -908,6 +916,14 @@ first (does `student_cnn_vit_alibi_pcen`-style TinyViT hold onto its accuracy wi
 `ffn_ratio=2`?) before any more firmware time goes into it. Recommended next step for
 `test-audiomoth-cnn`, not `AudioMoth-Firmware-Basic`.
 
+**Superseded - do not reuse the numbers above (added later).** Two problems with this probe:
+`attention_us` times only the `attnRunLayer()` calls (not the STFT, PCEN, `patch_embed` or the
+classifier), and its `arm_fully_connected_s8` calls pass `filter_dims = {out, 1, 1, in}` while
+CMSIS-NN reads `filter_dims->n` as the *accumulation depth* - so qkv really ran 96x96 (3x the
+MACs), FFN linear1 128x128 (4x) and linear2 32x32 (1/4x). The whole chain has since been
+measured with the real checkpoint and correct shapes: see "ViT real-time benchmark" at the end
+of this file - **37.5ms per buffer, 58.6% of the budget**.
+
 ## Post-PCEN-deployment findings (long-clip/TBPTT training, INT8 calibration, real-world mismatch)
 
 Everything below happened after the PCEN deployment/ViT probe work above, mostly on the
@@ -962,6 +978,13 @@ First export attempt (default max-based calibration): real INT8 87.1% frame AP v
 after the fix). `TRIGGER_PROBABILITY_THRESHOLD` set to the precision-at-recall>=95% value from
 that export's own PR curve (0.6747 initially, 0.6756 after a later re-export) - not a fixed
 constant, re-measure whenever `model.h`/`pcen.h` are re-exported from a different checkpoint.
+
+Later values, recorded after the fact: `main.c` was committed with 0.8 at `6e89ddf` (10 Aug),
+and the working copy now has 0.95. Neither matches a documented precision-at-recall>=95% export
+value, and `main.c`'s own comment above the constant still cites 0.6747. If these were chosen
+another way (e.g. by listening to real recordings, or to work around the `--pos-weight` output
+compression described at the end of this file), record the value and the reason here. The same
+working copy also shortens `TRIGGER_TAIL_SECONDS` from 5s to 3s.
 
 ### Calibrating INT8 on a percentile, not the literal max - PCEN's heavy-tailed output
 
@@ -1052,3 +1075,116 @@ the loss enough, on a capacity-limited model, to shift the whole output distribu
 rather than sharpening separation - to be tested by retraining without `--pos-weight`, and/or
 with `--focal-gamma` instead, once the bug above is fixed (no point tuning this on top of a
 known-mismatched training pipeline). Not yet resolved as of this entry.
+
+## ViT real-time benchmark with the real e32 checkpoint (`VIT_BENCHMARK`)
+
+Replaces the dummy-weight probe above with the real model and the whole per-buffer chain:
+STFT -> PCEN -> streaming INT8 TinyViT, all in the DMA ISR (the LSTM does not run), each
+sub-stage timed with the DWT cycle counter (enabled from software, works without a debugger;
+cross-checked against the BURTC: 48.00 MHz). **Code: branch `vit-benchmark`** - `VIT_BENCHMARK` in
+`src/main.c` (STFT_DEBUG_MODE, CSV output), `src/vit_inference.c`/`inc/vit_inference.h`, the e32
+export in `model/vit_model.c`/`.h` and its own learned PCEN in `model/pcen.c`/`.h` (replacing the
+LSTM's on that branch), `scripts/export_vit.py` (export + calibration + test vectors),
+`scripts/vit_host_check.sh` (the firmware C run on the host against PyTorch),
+`scripts/check_training_frontend.py` and `scripts/analyse_vit_csv.py` (summarises
+`VIT_TIMING.CSV`). Its sources rebuild the measured binary byte for byte.
+
+### Model and export
+
+`vad-sanity/out/student_windowed/student_windowed_vit_vit_e32_pcen.pt` (`train_windowed.py`,
+speech VAD on `audio_vad_long`): patch_embed `Linear(129, 32)` per STFT frame (7 tokens per
+64ms buffer), 2 post-LN encoder layers (causal ALiBi attention, 4 heads x 8 dims, window of 32
+tokens = 256ms, FFN 32->128->32 ReLU), classifier `Linear(32, 1)` per token, token logits averaged
+per buffer. **29,601 parameters** (patch_embed 4,160, 12,704 per layer, classifier 33) + 516
+learned PCEN parameters. ~230k MACs per buffer. 37.7KB of flash for ViT weights + PCEN tables,
+4KB of internal RAM for both layers' K/V windows. Whole image: 181KB of flash.
+
+- **n_heads/context_size aren't stored in the state dict** - checked behaviourally: validation
+  frame AP 0.907 / **0.960** / 0.955 with 2 / **4** / 8 heads (4 = the training default).
+- An explicit, step-by-step re-implementation of the forward pass (what the firmware streams
+  token by token) matches `TinyViT.frame_logits()` to 1.9e-6.
+- INT8: symmetric per-tensor weights and activations, calibrated on 8 training clips x 3min
+  (99.9th percentile for the PCEN input, 99.99th elsewhere); LayerNorm + its residual add in float.
+- **Layer 0's attention scores reach ~1e4** (near-hard attention): no single int8 scale can
+  resolve them. Only the gap to the row max matters to softmax, so QK is accumulated in int32
+  (ALiBi folded into the accumulator), the row max subtracted, and the gap requantized on a
+  fixed 0.1-nat grid (int8 [-128, 0] <-> [-12.8, 0] nats) before the softmax.
+- Fidelity, checked by compiling **the exact firmware C** (CMSIS-NN's portable kernels, bit-exact
+  with its Cortex-M4 DSP ones) on x86 and running it on real PCEN spectrograms of 5 test clips x
+  3min (14,060 buffers): logit correlation 0.9985 with float PyTorch, **frame AP 0.939 -> 0.936,
+  P@R95 0.748 -> 0.741**.
+- PCEN exported with the checkpoint's own learned values. Side finding: `export_pcen.py
+  --long-clips` currently crashes (`compute_initial_m_long` unpacks `LongClipDataset[i]` as 2
+  values, it now returns 3) - its logic was reproduced instead.
+- Was this checkpoint trained with the AGC-before-PCEN bug? Behavioural check on the float
+  model, same clips through both front ends: raw -> PCEN gives frame AP 0.960 (validation) /
+  0.939 (test) and mean P(negative) 0.08-0.11; pre-fix AGC -> PCEN gives 0.948 / 0.926 and mean
+  P(negative) 0.29-0.32. The model is calibrated for the raw front end, i.e. it behaves as
+  trained **after** the fix (evidence, not proof - the exact training code isn't recorded). Same
+  check on the LSTM h64 checkpoint is inconclusive on these synthetic clips.
+
+### First device run: `arm_softmax_s8` alone took half the ISR - and an overrun stalls the DMA
+
+| Stage (window full) | ms |
+|---|---|
+| **softmax (`arm_softmax_s8`, 2 layers)** | **42.5** |
+| FFN (linear1 + linear2, 2 layers) | 13.3 |
+| q/k/v (2 layers) | 6.7 |
+| STFT + PCEN | 6.0 |
+| patch_embed (+ input quantization) | 3.6 |
+| QK + attn.V + out_proj (2 layers) | 7.1 |
+| LayerNorm x4 | 1.6 |
+| **ISR total** | **81.0 (1.27x the budget)** |
+
+`arm_softmax_s8` costs ~1100 cycles per element (two fixed-point `exp()` per element), and grows
+linearly with the attention window (129k -> 1007k cycles per layer as the window filled from 7
+to ~32 tokens). STFT + PCEN at 6.0ms is the first real PCEN number (STFT + EMA was 4.7ms).
+
+**Operational finding, valid for every firmware mode:** that run stopped after 5 buffers. The DMA
+ping-pong descriptor is only refreshed once the ISR returns (`audiomoth.c`'s
+`transferComplete()`), so a single ISR longer than 64ms stops acquisition for good - not just a
+dropped buffer. The benchmark now never starts a token that would end past 58ms after ISR entry
+(`tokens_done` column); any deployment must keep its *worst case* strictly under 64ms.
+
+### Table softmax: the ViT runs in real time
+
+Since the scores reach the softmax as gaps to the row max on a fixed grid, `exp()` becomes a
+129-entry Q15 lookup and one integer reciprocal per row replaces the per-element fixed-point
+maths (same output convention, prob = (q + 128) / 256). Host fidelity unchanged (frame AP 0.9361,
+P@R95 0.7414 vs 0.7409 with `arm_softmax_s8`). On the device, 1788 consecutive buffers (114s), no
+gap, no skipped token, ISR period exactly 64.000ms:
+
+| Stage | ms | % of ISR |
+|---|---|---|
+| FFN linear1 + ReLU (2 layers) | 7.53 | 20.1% |
+| FFN linear2 (2 layers) | 4.64 | 12.4% |
+| STFT + PCEN | 6.04 | 16.1% |
+| q/k/v + K/V write (2 layers) | 6.03 | 16.1% |
+| patch_embed (+ input quantization) | 3.53 | 9.4% |
+| QK + ALiBi + max/gap (2 layers) | 2.70 | 7.2% |
+| attn.V (2 layers) | 2.05 | 5.5% |
+| out_proj (2 layers) | 1.98 | 5.3% |
+| LayerNorm x4 (+ residual) | 1.56 | 4.2% |
+| **softmax (table, 2 layers)** | **1.23** | 3.3% |
+| classifier + ISR glue | 0.22 | 0.6% |
+| **ISR total** | **37.51 (58.6% of 64ms)** | |
+
+Rock-stable: median, p99 and max all 37.5ms - nothing depends on the audio content. Softmax went
+from 42.5ms to 1.2ms (~35x); the untouched stages also moved by 5-10% (flash layout effect, see
+the rejected pointwise-conv entry earlier). With ~26.5ms of margin, the triggered-recording worst
+case (~+8ms pre-roll burst, measured for the LSTM build) would still fit (~46ms). For reference,
+the deployed LSTM h64 chain is ~42ms (36.1ms inference + 6.0ms STFT/PCEN) - the e32 ViT is now
+faster. Device logits (gain fixed at `AM_GAIN_MEDIUM` in this debug mode) showed P > 0.5 segments
+at ~10-13s, 47-50s, 76-82s and 107-111s, which the user believes match when they spoke
+(not verified - no audio was captured in this mode).
+
+Two more observations for the next step: fully-connected layers with short rows (32 inputs:
+q/k/v, out_proj, FFN linear1) run at ~7 cycles/MAC against ~4 for linear2's 128-input rows - the
+per-output-row overhead dominates them; and all of them are matrix-vector products, one token at
+a time.
+
+**Next optimization to look at: the FFN** - the largest stage, 12.2ms (32.5% of the ISR).
+Candidates: batching the buffer's 7 tokens through the FFN (and q/k/v, out_proj) as
+matrix-matrix products to amortize the per-row overhead (firmware only, exact), `ffn_ratio=2`
+(architecture change, needs retraining and accuracy validation), or computing the last layer only
+for the token(s) the output actually needs (needs a training-side readout change).
