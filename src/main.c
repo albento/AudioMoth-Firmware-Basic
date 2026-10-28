@@ -23,7 +23,7 @@
    exclusive with TRIGGERED_RECORDING_MODE below - only one of the two may be 1 at a time
    (see the #error guard just below). */
 
-#define STFT_DEBUG_MODE                          1
+#define STFT_DEBUG_MODE                          0
 
 /* Continuously listens and runs the on-device INT8 classifier (model_inference.c) every
    64ms buffer; whenever its output crosses TRIGGER_PROBABILITY_THRESHOLD, records a new WAV
@@ -32,7 +32,7 @@
    runTriggeredRecording(). See GUIDE_REIMPLEMENTATION.md for the STFT/model pipeline this
    reuses, and the plan this was built from for the full design rationale. */
 
-#define TRIGGERED_RECORDING_MODE                 0
+#define TRIGGERED_RECORDING_MODE                 1
 
 #if STFT_DEBUG_MODE && TRIGGERED_RECORDING_MODE
 #error "STFT_DEBUG_MODE and TRIGGERED_RECORDING_MODE are mutually exclusive - set at most one to 1"
@@ -4311,7 +4311,7 @@ static void runSTFTFeasibilityTest(void) {
    pcen.h are re-exported from a different checkpoint - this is per-checkpoint, not a fixed
    constant. */
 
-#define TRIGGER_PROBABILITY_THRESHOLD              0.8f
+#define TRIGGER_PROBABILITY_THRESHOLD              0.95f
 
 /* logit(p) = ln(p/(1-p)), the inverse of sigmoid - see TRIGGER_PROBABILITY_THRESHOLD's
    comment above. Computed once in runTriggeredRecording()'s init, not a compile-time
@@ -4320,13 +4320,13 @@ static void runSTFTFeasibilityTest(void) {
 
 static float triggerLogitThreshold;
 
-#define TRIGGER_TAIL_SECONDS                      5.0f
+#define TRIGGER_TAIL_SECONDS                      3.0f
 #define TRIGGER_PREROLL_SECONDS                   0.75f
 
 /* Whole 64ms buffers - the model's/ISR's own granularity - closest to
    ceil(seconds / (MAXIMUM_SAMPLES_IN_DMA_TRANSFER/STFT_SAMPLE_RATE)). */
 
-#define TRIGGER_TAIL_BUFFERS                      79   /* ~5.056s actual */
+#define TRIGGER_TAIL_BUFFERS                      47   /* ~5.056s actual */
 #define TRIGGER_PREROLL_BUFFERS                   12   /* ~0.768s actual */
 
 /* Power of two (indices masked with & (N-1)); usable capacity is TRIGGER_QUEUE_LENGTH-1 -
