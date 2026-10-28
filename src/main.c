@@ -25,6 +25,18 @@
 
 #define STFT_DEBUG_MODE                          1
 
+/* ViT real-time benchmark (only with STFT_DEBUG_MODE=1, CSV output): the DMA ISR runs the full
+   ViT chain - STFT, PCEN, then vit_inference.c's streaming INT8 TinyViT (real exported
+   weights, vit_model.c) - INSTEAD of the LSTM classifier, and logs per-stage DWT cycle counts
+   per buffer to VIT_TIMING.CSV. */
+
+#define VIT_BENCHMARK                            1
+
+#if VIT_BENCHMARK
+#include "em_device.h"
+#include "vit_inference.h"
+#endif
+
 /* Continuously listens and runs the on-device INT8 classifier (model_inference.c) every
    64ms buffer; whenever its output crosses TRIGGER_PROBABILITY_THRESHOLD, records a new WAV
    file (with ~TRIGGER_PREROLL_SECONDS of pre-roll audio), keeping it open while re-triggered
@@ -2996,10 +3008,16 @@ inline void AudioMoth_handleSwitchInterrupt() {
 #define STFT_OUTPUT_MODE_CSV                      0
 #define STFT_OUTPUT_MODE_BINARY                   1
 
-#define STFT_OUTPUT_MODE                          STFT_OUTPUT_MODE_BINARY
+#define STFT_OUTPUT_MODE                          STFT_OUTPUT_MODE_CSV
+
+#if VIT_BENCHMARK && STFT_OUTPUT_MODE != STFT_OUTPUT_MODE_CSV
+#error "VIT_BENCHMARK only supports STFT_OUTPUT_MODE_CSV"
+#endif
 
 #if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
 #define STFT_DATA_FILENAME                        "STFT_DATA_" STFT_MODE_SUFFIX ".BIN"
+#elif VIT_BENCHMARK
+#define STFT_DATA_FILENAME                        "VIT_TIMING.CSV"
 #else
 #define STFT_DATA_FILENAME                        "STFT_TIMING_" STFT_MODE_SUFFIX ".CSV"
 #endif
@@ -3121,6 +3139,24 @@ typedef struct {
     int16_t audio[MAXIMUM_SAMPLES_IN_DMA_TRANSFER];
     float32_t spectrogram[STFT_NUMBER_OF_FRAMES][STFT_NUMBER_OF_BINS];
     float32_t modelLogit;
+} stftRecord_t;
+
+#elif VIT_BENCHMARK
+
+/* One CSV row per buffer. Cycle counts are DWT->CYCCNT deltas (CPU clock); isrMicroseconds is the
+   same span read from the BURTC, so isrCycles / isrMicroseconds gives the real clock in MHz. */
+
+typedef struct {
+    uint32_t bufferIndex;
+    uint32_t periodCycles;
+    uint32_t isrCycles;
+    uint32_t isrMicroseconds;
+    uint32_t stftCycles;
+    uint32_t vitCycles;
+    ViTInferenceTiming_t vitTiming;
+    int32_t logitMilli;
+    uint32_t vitSkipped;
+    uint32_t droppedRecords;
 } stftRecord_t;
 
 #else
@@ -3958,6 +3994,97 @@ static void attnRunLayer(const int8_t *input, int8_t *output, uint32_t layer, At
 
 #if STFT_DEBUG_MODE
 
+#if VIT_BENCHMARK
+
+/* Full ViT chain in the ISR, as a real deployment would run it: STFT + PCEN, then the streaming
+   INT8 TinyViT, timed with the DWT cycle counter. If the record queue is backed up (the ISR
+   left the main loop too little time to write rows to the SD card), the ViT is skipped for
+   that buffer so the main loop can catch up - flagged in the row (vit_skipped), so those rows
+   can be excluded; the ViT's K/V history then has a one-buffer gap, which doesn't affect
+   timing. */
+
+/* The DMA is only re-armed once this ISR returns (audiomoth.c's transferComplete), so a single
+   ISR longer than one 64ms buffer stops acquisition for good - measured: the first benchmark
+   run stalled after 5 buffers. The ViT therefore never starts a token that would end past 58ms
+   (at 48MHz) after ISR entry; rows where that happened show tokens_done < 7. */
+
+#define VIT_ISR_DEADLINE_CYCLES                   (58 * 48000)
+
+static uint32_t vitLastIsrStartCycles;
+
+static uint32_t vitDroppedRecords;
+
+inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, int16_t **nextBuffer) {
+
+    uint32_t isrStartCycles = DWT->CYCCNT;
+
+    int16_t *source = isPrimaryBuffer ? primaryBuffer : secondaryBuffer;
+
+    uint32_t startTime, startMicroseconds;
+
+    AudioMoth_getTimeMicroseconds(&startTime, &startMicroseconds);
+
+    computeSpectrogram(source);
+
+    uint32_t stftEndCycles = DWT->CYCCNT;
+
+    uint32_t queued = (stftRecordQueueWriteIndex - stftRecordQueueReadIndex) & (STFT_RECORD_QUEUE_LENGTH - 1);
+
+    bool vitSkipped = queued >= STFT_RECORD_QUEUE_LENGTH / 2;
+
+    static ViTInferenceTiming_t vitTiming;
+
+    float vitLogit = 0.0f;
+
+    if (vitSkipped) {
+
+        memset(&vitTiming, 0, sizeof(vitTiming));
+
+    } else {
+
+        vitLogit = ViTInference_run(stftSpectrogramDb, &vitTiming, isrStartCycles + VIT_ISR_DEADLINE_CYCLES);
+
+    }
+
+    uint32_t vitEndCycles = DWT->CYCCNT;
+
+    uint32_t endTime, endMicroseconds;
+
+    AudioMoth_getTimeMicroseconds(&endTime, &endMicroseconds);
+
+    uint32_t nextWriteIndex = (stftRecordQueueWriteIndex + 1) & (STFT_RECORD_QUEUE_LENGTH - 1);
+
+    if (nextWriteIndex != stftRecordQueueReadIndex) {
+
+        stftRecord_t *record = &stftRecordQueue[stftRecordQueueWriteIndex];
+
+        record->bufferIndex = stftBufferCounter;
+        record->periodCycles = stftBufferCounter == 0 ? 0 : isrStartCycles - vitLastIsrStartCycles;
+        record->isrCycles = DWT->CYCCNT - isrStartCycles;
+        record->isrMicroseconds = (endTime - startTime) * MICROSECONDS_IN_SECOND + endMicroseconds - startMicroseconds;
+        record->stftCycles = stftEndCycles - isrStartCycles;
+        record->vitCycles = vitEndCycles - stftEndCycles;
+        record->vitTiming = vitTiming;
+        record->logitMilli = (int32_t)(vitLogit * 1000.0f);
+        record->vitSkipped = vitSkipped;
+        record->droppedRecords = vitDroppedRecords;
+
+        stftRecordQueueWriteIndex = nextWriteIndex;
+
+    } else {
+
+        vitDroppedRecords += 1;
+
+    }
+
+    vitLastIsrStartCycles = isrStartCycles;
+
+    stftBufferCounter += 1;
+
+}
+
+#else
+
 /* Replaces the normal recording ISR: instead of filtering the buffer into the SD card recording pipeline, compute its STFT and time how long that takes */
 
 inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, int16_t **nextBuffer) {
@@ -4089,6 +4216,8 @@ inline void AudioMoth_handleDirectMemoryAccessInterrupt(bool isPrimaryBuffer, in
 
 }
 
+#endif
+
 /* Standalone debug entry point: sample the microphone at a raw, undecimated STFT_SAMPLE_RATE and log the time taken to compute the STFT of each buffer to a text file on the SD card, instead of recording WAV audio */
 
 static void runSTFTFeasibilityTest(void) {
@@ -4176,9 +4305,22 @@ static void runSTFTFeasibilityTest(void) {
        plausible data row (18 uint32 fields, each up to 10 digits + a comma) with real margin
        to spare, not just enough to survive today's exact column count. */
 
-    static char lineBuffer[384];
+    static char lineBuffer[768];
 
-#if STFT_DEBUG_ATTENTION_TEST
+#if VIT_BENCHMARK
+
+#if VIT_DEPTH != 2
+#error "VIT_BENCHMARK's CSV columns are written for VIT_DEPTH == 2"
+#endif
+
+    uint32_t lineLength = sprintf(lineBuffer, "# VIT_BENCHMARK model=%s embed_dim=%d n_heads=%d context=%d ffn_dim=%d depth=%d\r\n"
+        "buffer_index,period_cycles,isr_cycles,isr_us,stft_pcen_cycles,vit_cycles,patch_embed_cycles,"
+        "l0_qkv,l0_qk,l0_softmax,l0_av,l0_outproj,l0_ln1,l0_ffn1,l0_ffn2,l0_ln2,"
+        "l1_qkv,l1_qk,l1_softmax,l1_av,l1_outproj,l1_ln1,l1_ffn1,l1_ffn2,l1_ln2,"
+        "classifier_cycles,logit_milli,vit_skipped,dropped_records,tokens_done\r\n",
+        VIT_MODEL_TAG, VIT_EMBED_DIM, VIT_N_HEADS, VIT_CONTEXT_SIZE, VIT_FFN_DIM, VIT_DEPTH);
+
+#elif STFT_DEBUG_ATTENTION_TEST
 
     uint32_t lineLength = sprintf(lineBuffer, "buffer_index,stft_time_us,inference_time_us,stage0_us,stage1_dw_us,stage1_pw_us,stage2_dw_us,stage2_pw_us,avgpool_us,lstm_us,classifier_us,attention_us,attn_qkv_us,attn_core_us,attn_outproj_us,attn_ln1_us,attn_ffn_us,attn_ln2_us\r\n");
 
@@ -4202,7 +4344,25 @@ static void runSTFTFeasibilityTest(void) {
 
     stftRecordQueueReadIndex = 0;
 
+#if VIT_BENCHMARK
+
+    /* DWT cycle counter: enabled from software, no debugger needed */
+
+    DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
+
+    DWT->CYCCNT = 0;
+
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    ViTInference_reset();
+
+    uint32_t vitRowsSinceSync = 0;
+
+#else
+
     ModelInference_reset();
+
+#endif
 
     resetRMSNormalization();
 
@@ -4224,13 +4384,45 @@ static void runSTFTFeasibilityTest(void) {
 
         while (stftRecordQueueReadIndex != stftRecordQueueWriteIndex) {
 
+#if VIT_BENCHMARK
+
+            /* The ISR can leave this loop little time - re-check the switch here too, so moving it
+               to USB is always honoured promptly (the check at the top of the outer loop then
+               closes the file and returns to the normal USB handling) */
+
+            if (AudioMoth_getSwitchPosition() == AM_SWITCH_USB) break;
+
+#endif
+
 #if STFT_OUTPUT_MODE == STFT_OUTPUT_MODE_BINARY
 
             AudioMoth_writeToFile(&stftRecordQueue[stftRecordQueueReadIndex], sizeof(stftRecord_t));
 
 #else
 
-#if STFT_DEBUG_ATTENTION_TEST
+#if VIT_BENCHMARK
+
+            const stftRecord_t *r = &stftRecordQueue[stftRecordQueueReadIndex];
+
+            const ViTInferenceTiming_t *t = &r->vitTiming;
+
+            lineLength = sprintf(lineBuffer, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,"
+                "%lu,%ld,%lu,%lu,%lu\r\n",
+                (unsigned long)r->bufferIndex, (unsigned long)r->periodCycles, (unsigned long)r->isrCycles,
+                (unsigned long)r->isrMicroseconds, (unsigned long)r->stftCycles, (unsigned long)r->vitCycles,
+                (unsigned long)t->patchEmbedCycles,
+                (unsigned long)t->qkvCycles[0], (unsigned long)t->qkCycles[0], (unsigned long)t->softmaxCycles[0],
+                (unsigned long)t->avCycles[0], (unsigned long)t->outProjCycles[0], (unsigned long)t->layerNorm1Cycles[0],
+                (unsigned long)t->ffn1Cycles[0], (unsigned long)t->ffn2Cycles[0], (unsigned long)t->layerNorm2Cycles[0],
+                (unsigned long)t->qkvCycles[1], (unsigned long)t->qkCycles[1], (unsigned long)t->softmaxCycles[1],
+                (unsigned long)t->avCycles[1], (unsigned long)t->outProjCycles[1], (unsigned long)t->layerNorm1Cycles[1],
+                (unsigned long)t->ffn1Cycles[1], (unsigned long)t->ffn2Cycles[1], (unsigned long)t->layerNorm2Cycles[1],
+                (unsigned long)t->classifierCycles, (long)r->logitMilli, (unsigned long)r->vitSkipped,
+                (unsigned long)r->droppedRecords, (unsigned long)t->tokensDone);
+
+#elif STFT_DEBUG_ATTENTION_TEST
 
             lineLength = sprintf(lineBuffer, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
                 (unsigned long)stftRecordQueue[stftRecordQueueReadIndex].bufferIndex,
@@ -4273,7 +4465,26 @@ static void runSTFTFeasibilityTest(void) {
 
 #endif
 
+#if VIT_BENCHMARK
+
+            /* Sync every 16 rows (~1s), not every row, so SD writes eat less of the little time
+               the ISR leaves the main loop */
+
+            vitRowsSinceSync += 1;
+
+            if (vitRowsSinceSync >= 16) {
+
+                AudioMoth_syncFile();
+
+                vitRowsSinceSync = 0;
+
+            }
+
+#else
+
             AudioMoth_syncFile();
+
+#endif
 
             stftRecordQueueReadIndex = (stftRecordQueueReadIndex + 1) & (STFT_RECORD_QUEUE_LENGTH - 1);
 

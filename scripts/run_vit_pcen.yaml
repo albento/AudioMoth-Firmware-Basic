@@ -1,0 +1,42 @@
+# Run config read by scripts/export_vit.py and scripts/check_training_frontend.py (test-audiomoth-cnn's
+# settings.py needs one) - a copy of test-audiomoth-cnn/runs/speech_vit_e64_pcen.yaml; only its
+# audio: section matters here (normalization: pcen).
+
+# Speech (VAD) experiment: TinyViT embed-dim 64, pcen normalization.
+# One of a 4-run matrix - {lstm h64, vit e64} x {learnable_agc, pcen} - identical in every other
+# respect so a difference between two results is attributable to those two axes alone.
+#
+# No `channels:` key here, deliberately: TinyViT has no conv frontend for it to size. Its input
+# is a plain linear patch embedding straight off the 129 STFT bins
+# (self.patch_embed = nn.Linear(n_freq_bins, embed_dim)), and build_model() doesn't even pass
+# channels through for --architecture vit - so writing "16,32,64" would be accepted and silently
+# do nothing. embed-dim is this model's capacity knob instead, hence the 64 below.
+#
+# Dataset: not named here on purpose. --dataset-dir defaults to settings.yaml's
+# paths.bird_sed_dir, which is where a path belongs; today that is the speech --mode long corpus
+# (vad-sanity/audio_vad_long). Point that at something else and this file trains on that instead.
+
+audio:
+  # per-band PCEN, with alpha/delta/r/smoothing learned per frequency bin (student_model.LearnablePCEN)
+  normalization: pcen
+  clip_seconds: 12.0
+  target_rms: 0.1
+  hold_seconds: 3.0
+
+seed: 0
+
+distill:                # train_windowed.py reads lr/patience from here
+  batch_size: 64
+  lr: 1.0e-3
+  backbone_lr_scale: 0.1
+  patience: 10
+
+args:
+  architecture: vit
+  vit-embed-dim: 64
+  vit-context-size: 32  # default; causal attention window in raw STFT frames (~8ms each)
+  vit-depth: 2
+  vit-heads: 4
+  pos-weight: true
+  tag: speech_vit_e64_pcen
+  epochs: 50
